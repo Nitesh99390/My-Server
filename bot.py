@@ -125,7 +125,7 @@ except ImportError:  # pragma: no cover
 # =============================================================================
 # Configuration
 # =============================================================================
-VERSION = "4.2.0"
+VERSION = "4.3.0"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -156,16 +156,21 @@ CHUNK_SIZE = max(500, min(_env_int("CHUNK_SIZE", 3000), 6000))
 # stays healthy.  The ceiling is additionally clamped to the ``max_concurrency``
 # each server advertises on /health, so the bot never queues requests on a
 # server that cannot run them (queueing = 503 fail-overs = wasted slots).
-PER_SERVER_CONCURRENCY = max(1, min(_env_int("PER_SERVER_CONCURRENCY", 4), 8))
+PER_SERVER_CONCURRENCY = max(1, min(_env_int("PER_SERVER_CONCURRENCY", 6), 8))
 PER_SERVER_MAX_CONCURRENCY = max(PER_SERVER_CONCURRENCY, min(_env_int("PER_SERVER_MAX_CONCURRENCY", 8), 8))
 # Spacing between new HTTP requests to one render server.  The server paces the
 # actual Edge connections itself (MIN_START_GAP_MS), so this only has to stop
 # a burst of dozens of connections at once.
-REMOTE_MIN_GAP = max(0, _env_int("REMOTE_MIN_GAP_MS", 30)) / 1000.0
+REMOTE_MIN_GAP = max(0, _env_int("REMOTE_MIN_GAP_MS", 10)) / 1000.0
 # Clean chunks a render server must deliver before it gets one more parallel
 # slot.  Render servers each sit on their own IP and are fronted by their own
 # limiter, so they can ramp up much faster than the built-in engine.
-REMOTE_GROW_AFTER = max(1, min(_env_int("REMOTE_GROW_AFTER", 3), 50))
+REMOTE_GROW_AFTER = max(1, min(_env_int("REMOTE_GROW_AFTER", 2), 50))
+# Target utilisation of every engine's ceiling.  At job start each limiter is
+# warmed straight to  ceil(maximum * TARGET_UTILISATION)  instead of ramping up
+# one chunk at a time, so a 1000-chunk job runs at full speed from chunk 1.
+# Throttling still steps the limiter down; it only climbs back while healthy.
+TARGET_UTILISATION = max(0.3, min(_env_int("TARGET_UTILISATION_PCT", 90), 100)) / 100.0
 # Hard ceiling on in-flight requests across ALL engines; with many render servers
 # this is the only cap (each server also has its own adaptive limiter).
 MAX_TOTAL_CONCURRENCY = max(4, min(_env_int("MAX_TOTAL_CONCURRENCY", 64), 256))
@@ -234,23 +239,23 @@ PLAN_SLICE_CHARS = 200_000
 LOCAL_TTS_URL = "local://edge-tts"
 LOCAL_TTS_ENABLED = (os.getenv("LOCAL_TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
                      and edge_tts is not None)
-LOCAL_TTS_MAX_CONCURRENCY = max(1, min(_env_int("LOCAL_TTS_MAX_CONCURRENCY", 6), 8))
-LOCAL_TTS_CONCURRENCY = max(1, min(_env_int("LOCAL_TTS_CONCURRENCY", 4), LOCAL_TTS_MAX_CONCURRENCY))
+LOCAL_TTS_MAX_CONCURRENCY = max(1, min(_env_int("LOCAL_TTS_MAX_CONCURRENCY", 8), 8))
+LOCAL_TTS_CONCURRENCY = max(1, min(_env_int("LOCAL_TTS_CONCURRENCY", 6), LOCAL_TTS_MAX_CONCURRENCY))
 LOCAL_TTS_CHUNK_SIZE = max(500, min(_env_int("LOCAL_TTS_CHUNK_SIZE", 3000), 5000))
 # Edge's hard limit is 4096 bytes per message (after XML escaping); keep a margin.
 LOCAL_TTS_MAX_BYTES = max(1000, min(_env_int("LOCAL_TTS_MAX_BYTES", 3900), 4000))
 LOCAL_TTS_RETRIES = max(1, min(_env_int("LOCAL_TTS_RETRIES", 4), 8))
-LOCAL_TTS_MIN_GAP = max(0, _env_int("LOCAL_TTS_MIN_GAP_MS", 150)) / 1000.0
-LOCAL_TTS_TIMEOUT = max(20, _env_int("LOCAL_TTS_TIMEOUT", 90))  # seconds per chunk attempt
+LOCAL_TTS_MIN_GAP = max(0, _env_int("LOCAL_TTS_MIN_GAP_MS", 40)) / 1000.0
+LOCAL_TTS_TIMEOUT = max(20, _env_int("LOCAL_TTS_TIMEOUT", 75))  # seconds per chunk attempt
 # How many consecutive clean chunks before the limiter adds one more stream.
-LOCAL_TTS_GROW_AFTER = max(3, min(_env_int("LOCAL_TTS_GROW_AFTER", 8), 50))
+LOCAL_TTS_GROW_AFTER = max(2, min(_env_int("LOCAL_TTS_GROW_AFTER", 3), 50))
 # Chunks kept in flight / buffered ahead of the writer (bounds memory).  A
 # larger window keeps every slot busy even when one early chunk is slow and
 # the (in-order) writer has to wait for it.
-PIPELINE_WINDOW_EXTRA = max(2, min(_env_int("PIPELINE_WINDOW_EXTRA", 8), 64))
+PIPELINE_WINDOW_EXTRA = max(2, min(_env_int("PIPELINE_WINDOW_EXTRA", 16), 64))
 # Minimum seconds between progress-message edits (Telegram flood protection;
 # every edit used to block the pipeline for a network round-trip).
-PROGRESS_EDIT_INTERVAL = max(2.0, _env_int("PROGRESS_EDIT_INTERVAL", 4))
+PROGRESS_EDIT_INTERVAL = max(2.0, _env_int("PROGRESS_EDIT_INTERVAL", 5))
 SUPPORTED_EXT = {".txt", ".md", ".docx", ".html", ".htm", ".epub", ".pdf"}
 FFMPEG = shutil.which("ffmpeg")
 
@@ -1144,8 +1149,10 @@ class ServerPool:
             if error:
                 s.last_error = error[:200]
             if s.streak >= 2:
-                # Escalating per-server cooldown; never permanent - the server may recover.
-                s.cooldown_until = time.time() + min(180, 10 * s.streak)
+                # Escalating per-server cooldown; never permanent - the server may
+                # recover.  Kept short so a healthy engine that hit two flaky
+                # connections is back in rotation within seconds, not minutes.
+                s.cooldown_until = time.time() + min(60, 3 * s.streak)
 
     def all_cooling(self) -> bool:
         """True when every engine is in cooldown (global throttle / outage)."""
@@ -1195,10 +1202,17 @@ class ServerPool:
                 lim = remote_limiter(url)
                 lim.maximum = max(1, min(8, limit))
                 lim.current = max(1, min(lim.current, lim.maximum))
-                # Fresh, healthy server: start close to its ceiling instead of
-                # spending the first dozens of chunks ramping up.
-                if info.get("ok") and not info.get("throttled") and lim.throttle_events == 0:
+                # Fresh, healthy server: start at TARGET_UTILISATION of its ceiling
+                # instead of spending the first dozens of chunks ramping up.
+                if info.get("ok") and not info.get("throttled"):
                     lim.current = max(lim.current, min(lim.maximum, PER_SERVER_CONCURRENCY))
+                    lim.warm_start()
+
+    def warm_start(self) -> None:
+        """Bring every healthy engine to TARGET_UTILISATION of its ceiling."""
+        for s in self.states:
+            if s.cooldown_until <= time.time():
+                s.limiter.warm_start()
 
     def max_concurrency(self) -> int:
         """Upper bound used to size the request pipeline.
@@ -1350,16 +1364,29 @@ class ThrottleError(RuntimeError):
     """Raised when Microsoft's free endpoint rejects / throttles a request."""
 
 
-def _is_throttle_error(exc: BaseException) -> bool:
-    """Classify edge-tts / aiohttp failures that indicate rate limiting."""
+def _is_hard_throttle(exc: BaseException) -> bool:
+    """Microsoft explicitly refused us (403/429 / handshake rejected).
+
+    Only these signals justify cutting the parallelism sharply; everything else
+    (a dropped websocket, an empty stream, a timeout) is a *soft* failure that
+    steps the limiter down by one and is retried right away.
+    """
     name = type(exc).__name__
     text = str(exc).lower()
-    if isinstance(exc, ThrottleError):
-        return True
     if "403" in text or "429" in text or "too many" in text or "throttl" in text:
         return True
-    if name in {"WSServerHandshakeError", "ClientResponseError", "ClientConnectorError",
-                "ServerDisconnectedError", "WebSocketError", "NoAudioReceived", "ClientOSError"}:
+    return name in {"WSServerHandshakeError", "ClientResponseError"}
+
+
+def _is_throttle_error(exc: BaseException) -> bool:
+    """Classify edge-tts / aiohttp failures that indicate rate limiting (hard or soft)."""
+    name = type(exc).__name__
+    if isinstance(exc, ThrottleError):
+        return True
+    if _is_hard_throttle(exc):
+        return True
+    if name in {"ClientConnectorError", "ServerDisconnectedError", "WebSocketError",
+                "NoAudioReceived", "ClientOSError"}:
         return True
     if isinstance(exc, asyncio.TimeoutError):
         return True
@@ -1371,8 +1398,12 @@ class AdaptiveLimiter:
 
     * Only `current` coroutines may synthesise at the same time.
     * New connections are spaced at least `min_gap` seconds apart (burst protection).
-    * After a throttle signal the capacity halves and a cool-down starts.
+    * A *soft* throttle signal (dropped socket, empty audio, timeout) steps the
+      capacity down by one; a *hard* signal (HTTP 403/429) halves it.  Both start
+      a short cool-down that grows with repeated events.
     * After `grow_after` consecutive successes the capacity grows by one, up to `maximum`.
+    * ``warm_start()`` jumps straight to ``TARGET_UTILISATION`` of the ceiling so
+      long jobs do not spend their first minutes ramping up.
     """
 
     def __init__(self, start: int, maximum: int, min_gap: float, grow_after: int = LOCAL_TTS_GROW_AFTER) -> None:
@@ -1435,22 +1466,39 @@ class AdaptiveLimiter:
             self._streak = 0
             log.info("Edge-TTS healthy - concurrency raised to %d", self.current)
 
-    def report_throttle(self) -> float:
-        """Shrink capacity; return the back-off delay the caller should sleep."""
+    def report_throttle(self, hard: bool = False) -> float:
+        """Shrink capacity; return the back-off delay the caller should sleep.
+
+        ``hard=True`` (explicit 403/429) halves the limit; a soft signal only
+        steps it down by one so a single flaky connection does not idle half
+        the engine for the next minutes.
+        """
         self._streak = 0
         self.throttle_events += 1
-        new = max(1, self.current // 2)
+        new = max(1, self.current // 2) if hard else max(1, self.current - 1)
         if new != self.current:
-            log.warning("Edge-TTS throttling detected - concurrency lowered %d -> %d", self.current, new)
+            log.warning("Edge-TTS %s throttle signal - concurrency lowered %d -> %d",
+                        "hard" if hard else "soft", self.current, new)
         self.current = new
-        pause = min(30.0, 2.0 * self.throttle_events) + random.uniform(0.0, 1.0)
+        base = 2.0 if hard else 0.75
+        pause = min(20.0 if hard else 6.0, base * self.throttle_events) + random.uniform(0.0, 0.5)
         self._cooldown_until = max(self._cooldown_until, time.monotonic() + pause)
         return pause
 
+    def warm_start(self, utilisation: float = TARGET_UTILISATION) -> None:
+        """Jump to ``utilisation`` of the ceiling if the engine has been healthy."""
+        if self.throttle_events:
+            return
+        target = max(1, min(self.maximum, math.ceil(self.maximum * utilisation)))
+        if target > self.current:
+            log.info("Warm start - concurrency %d -> %d (%.0f%% of %d)", self.current, target,
+                     utilisation * 100, self.maximum)
+            self.current = target
+
     def report_ok_window(self) -> None:
         """Forget old throttle events once traffic has been clean for a while."""
-        if self._streak >= self.grow_after * 2:
-            self.throttle_events = 0
+        if self.throttle_events and self._streak >= self.grow_after * 2:
+            self.throttle_events = max(0, self.throttle_events - 1)
 
     def snapshot(self) -> Dict[str, Any]:
         return {"active": self._active, "limit": self.current, "max": self.maximum,
@@ -1558,13 +1606,15 @@ async def local_synthesize(text: str, settings: Dict[str, Any], cancel: asyncio.
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if _is_throttle_error(exc):
-                pause = local_limiter.report_throttle()
+                pause = local_limiter.report_throttle(hard=_is_hard_throttle(exc))
             log.warning("Edge-TTS attempt %d/%d failed (%s): %s", attempt, attempts, type(exc).__name__,
                         str(exc)[:160])
         finally:
             await local_limiter.release()
         if attempt < attempts:
-            backoff = min(45.0, (1.5 ** attempt) + pause + random.uniform(0.2, 1.2))
+            # Soft failures retry almost immediately (the limiter's cool-down
+            # already spaces new connections); only hard throttles wait longer.
+            backoff = min(30.0, (0.6 * attempt) + pause + random.uniform(0.1, 0.6))
             await cancellable_sleep(backoff, cancel)
     local_last_error = _describe_exc(last_exc)
     log.error("Edge-TTS chunk failed after %d attempts: %s", attempts, local_last_error)
@@ -1607,7 +1657,7 @@ async def local_engine_health() -> Dict[str, Any]:
         info["latency"] = round(time.time() - t0, 2)
         info["error"] = _describe_exc(exc)
         if _is_throttle_error(exc):
-            local_limiter.report_throttle()
+            local_limiter.report_throttle(hard=_is_hard_throttle(exc))
     return info
 
 
@@ -1682,6 +1732,7 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
             t0 = time.monotonic()
             retry_after = min(10, 1.5 * attempt)
             throttled = False
+            hard_throttle = False
             try:
                 await limiter.acquire(cancel)
                 try:
@@ -1741,7 +1792,11 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
                                     server.cooldown_until = max(server.cooldown_until, time.time() + 1.0)
                                 else:
                                     throttled = True
-                                    server.cooldown_until = max(server.cooldown_until, time.time() + retry_after)
+                                    # 429 = the server's own rate limit refused us outright;
+                                    # 502/504 = its Edge upstream hiccuped (soft).
+                                    hard_throttle = resp.status == 429 or "403" in reason
+                                    server.cooldown_until = max(server.cooldown_until,
+                                                                time.time() + min(retry_after, 15.0))
                                     pool.report(server, False, error=reason)
                             else:
                                 pool.report(server, False, error=await _describe_http_error(resp))
@@ -1755,10 +1810,11 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
                 log.debug("Chunk %d attempt %d timed out on %s", index, attempt, server.url)
             except Exception as exc:
                 throttled = _is_throttle_error(exc)
+                hard_throttle = _is_hard_throttle(exc)
                 pool.report(server, False, error=_describe_exc(exc))
                 log.debug("Chunk %d attempt %d failed on %s: %s", index, attempt, server.url, exc)
             if throttled:
-                limiter.report_throttle()
+                limiter.report_throttle(hard=hard_throttle)
             if attempt < MAX_CHUNK_ATTEMPTS and len(rejected) < len(pool.states):
                 # Fail over immediately when another engine is free; the slot is
                 # too valuable to spend sleeping.  Only wait when everything else
@@ -2946,6 +3002,17 @@ def _write_chunk(jdir: str, index: int, data: bytes, dur: int) -> None:
         f.write(str(dur))
 
 
+def _read_chunk(jdir: str, index: int) -> Tuple[bytes, int]:
+    """Load a checkpointed chunk and its duration (ms, 0 if unknown)."""
+    with open(chunk_path(jdir, index), "rb") as f:
+        return f.read(), _read_meta(jdir, index)
+
+
+def _append_file(path: str, data: bytes) -> None:
+    with open(path, "ab") as f:
+        f.write(data)
+
+
 def _chunk_ready(jdir: str, index: int) -> bool:
     p = chunk_path(jdir, index)
     return os.path.isfile(p) and os.path.getsize(p) > 100 and os.path.isfile(p + ".ms")
@@ -3230,8 +3297,11 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: Opt
                         pool.apply_probe(url, info)
                 for s in pool.states:
                     if s.url in cooling:
-                        s.cooldown_until = time.time() + 20
+                        s.cooldown_until = time.time() + 10
                         s.last_error = "temporarily unavailable at job start"
+                # Run every healthy engine at TARGET_UTILISATION of its ceiling from
+                # the very first chunk; the limiters still step down on throttling.
+                pool.warm_start()
                 if skipped:
                     await safe_edit(status, "Skipping misconfigured engine(s):\n" +
                                     "\n".join(f"- {html.escape(s)[:160]}" for s in skipped[:5]) +
@@ -3314,23 +3384,38 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: Opt
                     cps = fresh_chars / elapsed if fresh_chars else 0.0
                     eta = (total_chars - done_chars) / cps if cps > 0 else 0.0
                     speed = (gen_audio_ms / 1000.0) / elapsed if gen_audio_ms else 0.0
-                    engines = len(pool.states)
                     active = pool.active()
                     par = pool.concurrency()
-                    speed_line = (f"Speed: {cps:,.0f} chars/s ({speed:.1f}x realtime)" if cps > 0
-                                  else "Speed: warming up…")
+                    ceiling = pool.max_concurrency()
+                    util = int(par / ceiling * 100) if ceiling else 0
+                    throttles = sum(s.limiter.throttle_events for s in pool.states)
+                    engine_bits = []
+                    for s in pool.states:
+                        lim = s.limiter
+                        tag = "local" if s.is_local else (re.sub(r"^https?://", "", s.url).split("/")[0][:18])
+                        state = "⏸" if s.cooldown_until > time.time() else "●"
+                        engine_bits.append(f"{state} {tag} {lim.active}/{lim.current}")
+                    engine_line = "\n".join(f"  {b}" for b in engine_bits[:6])
+                    if len(engine_bits) > 6:
+                        engine_line += f"\n  … +{len(engine_bits) - 6} more"
+                    speed_line = (f"⚡ {cps:,.0f} chars/s · {speed:.1f}× realtime" if cps > 0
+                                  else "⚡ warming up…")
+                    audio_done = fmt_duration((total_audio_ms + part_ms) / 1000)
+                    lines = [
+                        "🎧 **Generating audiobook**",
+                        f"`[{progress_bar(percent, 16)}]` **{percent}%**",
+                        f"Chunks {done_chunks:,}/{total_chunks:,} · {done_chars:,}/{total_chars:,} chars",
+                        f"Audio ready: {audio_done} · Parts delivered: {delivered}",
+                        f"⏱ ETA {fmt_duration(eta) if cps > 0 else '—'} · elapsed {fmt_duration(now - started)}",
+                        speed_line,
+                        f"🔀 {active}/{par} in flight · {util}% of capacity · {len(pool.states)} engine(s)"
+                        + (f" · {throttles} throttle" if throttles else ""),
+                        engine_line,
+                    ]
                     if uploading:
-                        upload_line = f"\nUploading part {uploading.get('number')} ({fmt_size(uploading.get('size', 0))}) in background"
-                    else:
-                        upload_line = ""
-                    await safe_edit(status,
-                                    f"**Generating audiobook**\n"
-                                    f"[{progress_bar(percent)}] {percent}% ({done_chunks}/{total_chunks} chunks)\n"
-                                    f"Delivered: {delivered} parts | ETA {fmt_duration(eta)}\n"
-                                    f"{speed_line}\n"
-                                    f"{engines} engine(s) | {active}/{par} requests in flight"
-                                    f"{upload_line}",
-                                    cancel_markup)
+                        lines.append(f"⬆️ Uploading part {uploading.get('number')} "
+                                     f"({fmt_size(uploading.get('size', 0))}) in background")
+                    await safe_edit(status, "\n".join(lines), cancel_markup)
 
                 await report_progress(force=True)
                 pending: Dict[int, asyncio.Task] = {}
@@ -3376,12 +3461,14 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: Opt
                                 gen_started = time.monotonic()
                                 gen_chars_at_start = char_offsets[min(done_chunks, total_chunks)]
                                 gen_audio_ms = 0
+                                pool.warm_start()
                                 continue
-                            _write_chunk(jdir, next_write, data, dur)
+                            # Checkpoint + append happen off the event loop so the
+                            # scheduler keeps feeding the engines while the disk works.
+                            await asyncio.to_thread(_write_chunk, jdir, next_write, data, dur)
                         elif _chunk_ready(jdir, next_write):
-                            with open(chunk_path(jdir, next_write), "rb") as f:
-                                data = f.read()
-                            dur = _read_meta(jdir, next_write) or max(1, round(
+                            data, dur = await asyncio.to_thread(_read_chunk, jdir, next_write)
+                            dur = dur or max(1, round(
                                 estimate_seconds(len(plan[next_write][1]), settings["rate"]) * 1000))
                         else:
                             # Should not happen; re-submit defensively.
@@ -3399,8 +3486,7 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: Opt
                             await finalize_part()
                         if len(data) > MAX_AUDIO_BYTES or dur > max_part_ms:
                             raise ValueError("A single audio chunk exceeds the part limit")
-                        with open(out_path, "ab") as output:
-                            output.write(data)
+                        await asyncio.to_thread(_append_file, out_path, data)
                         part_bytes += len(data)
                         part_ms += dur
                         part_chars += len(chunk_text)
