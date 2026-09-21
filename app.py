@@ -32,7 +32,8 @@
    API_KEY            if set, clients must send header  X-API-Key: <key>
                       (or ?api_key=<key>)
    MAX_TEXT_LENGTH    default 6000 characters per request
-   MAX_CONCURRENCY    default 6 simultaneous synth jobs
+   MAX_CONCURRENCY    default 4 simultaneous synth jobs (max 8; higher gets the IP throttled)
+   MIN_START_GAP_MS   default 200 ms between new Edge-TTS connections (burst protection)
    DEFAULT_VOICE      default hi-IN-MadhurNeural
    TTS_RETRIES        default 3
    RATE_LIMIT         requests per minute per IP (default 120, 0 = disabled)
@@ -57,6 +58,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 import logging
 import os
 import queue
+import random
 import re
 import threading
 import time
@@ -76,7 +78,7 @@ except Exception:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -93,7 +95,10 @@ def _env_bool(name: str, default: bool) -> bool:
 PORT = _env_int("PORT", 10000)
 API_KEY = os.getenv("API_KEY", "").strip()
 MAX_TEXT_LENGTH = max(1, _env_int("MAX_TEXT_LENGTH", 6000))
-MAX_CONCURRENCY = max(1, _env_int("MAX_CONCURRENCY", 6))
+# Microsoft's free endpoint throttles a single IP that opens too many streams at
+# once (403 / dropped websockets).  4 parallel streams is a safe, fast default.
+MAX_CONCURRENCY = max(1, min(_env_int("MAX_CONCURRENCY", 4), 8))
+MIN_START_GAP = max(0, _env_int("MIN_START_GAP_MS", 200)) / 1000.0
 DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "hi-IN-MadhurNeural").strip()
 TTS_RETRIES = max(1, _env_int("TTS_RETRIES", 3))
 RATE_LIMIT = _env_int("RATE_LIMIT", 120)
@@ -141,6 +146,10 @@ class AsyncRunner:
         self.semaphore: asyncio.Semaphore = asyncio.run_coroutine_threadsafe(
             self._make_semaphore(), self.loop
         ).result(timeout=10)
+        self.gap_lock: asyncio.Lock = asyncio.run_coroutine_threadsafe(self._make_lock(), self.loop).result(timeout=10)
+        self.last_start = 0.0
+        self.cooldown_until = 0.0
+        self.throttle_events = 0
 
     def _run(self) -> None:
         asyncio.set_event_loop(self.loop)
@@ -149,6 +158,29 @@ class AsyncRunner:
     @staticmethod
     async def _make_semaphore() -> asyncio.Semaphore:
         return asyncio.Semaphore(MAX_CONCURRENCY)
+
+    @staticmethod
+    async def _make_lock() -> asyncio.Lock:
+        return asyncio.Lock()
+
+    async def pace(self) -> None:
+        """Space out connection starts so we never burst at Microsoft's endpoint."""
+        async with self.gap_lock:
+            now = time.monotonic()
+            wait = max(self.cooldown_until - now, self.last_start + MIN_START_GAP - now)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self.last_start = time.monotonic()
+
+    def note_throttle(self) -> float:
+        self.throttle_events += 1
+        pause = min(20.0, 1.5 * self.throttle_events)
+        self.cooldown_until = max(self.cooldown_until, time.monotonic() + pause)
+        return pause
+
+    def note_success(self) -> None:
+        if self.throttle_events and time.monotonic() > self.cooldown_until + 60:
+            self.throttle_events = 0
 
     def run(self, coro, timeout: float = SYNTH_TIMEOUT):
         fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
@@ -376,23 +408,35 @@ async def _synthesize_once(text: str, voice: str, rate: str, pitch: str, volume:
     return bytes(audio), duration_ms, words
 
 
+def _looks_throttled(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return ("403" in text or "429" in text or "too many" in text or "throttl" in text
+            or type(exc).__name__ in {"WSServerHandshakeError", "ClientResponseError", "WebSocketError",
+                                      "NoAudioReceived", "ServerDisconnectedError", "ClientConnectorError"})
+
+
 async def synthesize(text: str, voice: str, rate: str, pitch: str, volume: str,
                      collect_words: bool = False):
-    """Synthesize with retry + concurrency limiting."""
+    """Synthesize with retry + concurrency limiting + start pacing (throttle safe)."""
     last_err: Optional[Exception] = None
     async with runner.semaphore:
         for attempt in range(1, TTS_RETRIES + 1):
+            await runner.pace()
             try:
-                return await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     _synthesize_once(text, voice, rate, pitch, volume, collect_words),
                     timeout=max(1, (SYNTH_TIMEOUT - 3) / TTS_RETRIES),
                 )
+                runner.note_success()
+                return result
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
+                pause = runner.note_throttle() if _looks_throttled(exc) else 0.0
                 log.warning("Synthesis attempt %d/%d failed (%s): %s",
                             attempt, TTS_RETRIES, type(exc).__name__, exc)
                 if attempt < TTS_RETRIES:
-                    await asyncio.sleep(1.0 * attempt)
+                    # exponential back-off with jitter; longer when throttled
+                    await asyncio.sleep(min(30.0, (1.5 ** attempt) + pause + random.uniform(0.1, 0.8)))
     raise RuntimeError(f"TTS failed after {TTS_RETRIES} attempts: {type(last_err).__name__}: {last_err}")
 
 
@@ -760,6 +804,7 @@ def tts_stream():
 
     async def produce_audio():
         async with runner.semaphore:
+            await runner.pace()
             communicate = _make_communicate(**params)
             received = False
             async for chunk in communicate.stream():

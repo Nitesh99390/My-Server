@@ -12,7 +12,9 @@
    * Supports  .txt .md .docx .html .htm .epub .pdf  + plain text messages
    * Smart sentence-aware chunking, duration-aware part splitting
    * Optional chapter-aware splitting (Chapter 1 / अध्याय 1 / Part 1 ...)
-   * Multi-server load balancing with health scoring and automatic failover
+   * Built-in FREE Edge-TTS engine (no API key) with adaptive, throttle-safe
+     parallelism - fast, but automatically slows down before Microsoft blocks the IP
+   * Optional multi-server load balancing with health scoring and automatic failover
    * Real-time progress bar with ETA, /cancel support, per-user job queue
    * Voice preview, 20+ built-in voices (Hindi, English, Indian languages),
      custom voice input validated against the render server
@@ -31,9 +33,17 @@
    DB_PATH            default bot_database.db
    LOG_LEVEL          default INFO
 
+   Built-in FREE Edge-TTS engine (no API key, no render server needed)
+   LOCAL_TTS_ENABLED          default true  - synthesise directly inside the bot
+   LOCAL_TTS_CONCURRENCY      default 3     - parallel Edge-TTS streams to start with
+   LOCAL_TTS_MAX_CONCURRENCY  default 5     - hard ceiling (auto-scales up while healthy)
+   LOCAL_TTS_CHUNK_SIZE       default 2500  - characters per Edge-TTS request
+   LOCAL_TTS_RETRIES          default 4     - attempts per chunk before failing over
+   LOCAL_TTS_MIN_GAP_MS       default 250   - spacing between new connections (anti-throttle)
+
  Requirements
  ------------
-   pip install pyrogram tgcrypto aiohttp python-docx ebooklib beautifulsoup4 pypdf
+   pip install pyrogram tgcrypto aiohttp edge-tts python-docx ebooklib beautifulsoup4 pypdf
 =============================================================================
 """
 
@@ -49,6 +59,7 @@ from urllib.parse import urlsplit, urlunsplit
 import html
 import logging
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -61,6 +72,11 @@ from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
+
+try:  # Built-in free Microsoft Edge neural TTS (no API key required)
+    import edge_tts
+except ImportError:  # pragma: no cover
+    edge_tts = None  # type: ignore
 
 # Pyrogram 2.x expects an event loop at import time on Python 3.13+.
 try:
@@ -105,7 +121,7 @@ except ImportError:  # pragma: no cover
 # =============================================================================
 # Configuration
 # =============================================================================
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -141,6 +157,22 @@ MAX_EXTRACTED_CHARS = max(1000, _env_int("MAX_EXTRACTED_CHARS", 2_000_000))
 MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
 MAX_AUDIO_BYTES = 1900 * 1024 * 1024  # below Telegram's 2 GB limit
 MAX_QUEUED_JOBS = max(MAX_PARALLEL_JOBS, _env_int("MAX_QUEUED_JOBS", 20))
+
+# --- Built-in free Edge-TTS engine -------------------------------------------
+# Microsoft's free endpoint silently throttles (HTTP 403 / closed websockets)
+# when one IP opens too many streams at once.  These defaults are tuned to be
+# noticeably faster than sequential generation while staying under that limit;
+# the engine scales itself down automatically when it sees throttling and
+# creeps back up once things are healthy again.
+LOCAL_TTS_URL = "local://edge-tts"
+LOCAL_TTS_ENABLED = (os.getenv("LOCAL_TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+                     and edge_tts is not None)
+LOCAL_TTS_MAX_CONCURRENCY = max(1, min(_env_int("LOCAL_TTS_MAX_CONCURRENCY", 5), 8))
+LOCAL_TTS_CONCURRENCY = max(1, min(_env_int("LOCAL_TTS_CONCURRENCY", 3), LOCAL_TTS_MAX_CONCURRENCY))
+LOCAL_TTS_CHUNK_SIZE = max(500, min(_env_int("LOCAL_TTS_CHUNK_SIZE", 2500), 5000))
+LOCAL_TTS_RETRIES = max(1, min(_env_int("LOCAL_TTS_RETRIES", 4), 8))
+LOCAL_TTS_MIN_GAP = max(0, _env_int("LOCAL_TTS_MIN_GAP_MS", 250)) / 1000.0
+LOCAL_TTS_TIMEOUT = max(20, _env_int("LOCAL_TTS_TIMEOUT", 120))  # seconds per chunk attempt
 SUPPORTED_EXT = {".txt", ".md", ".docx", ".html", ".htm", ".epub", ".pdf"}
 FFMPEG = shutil.which("ffmpeg")
 
@@ -746,6 +778,10 @@ class ServerState:
         return f"{self.url}/tts"
 
     @property
+    def is_local(self) -> bool:
+        return self.url == LOCAL_TTS_URL
+
+    @property
     def score(self) -> float:
         return self.latency + self.failures * 2.0
 
@@ -784,7 +820,9 @@ class ServerPool:
                 s.cooldown_until = time.time() + min(120, 15 * s.failures)
 
     def concurrency(self) -> int:
-        return max(1, min(MAX_TOTAL_CONCURRENCY, PER_SERVER_CONCURRENCY * len(self.states)))
+        remote = sum(1 for s in self.states if not s.is_local)
+        local = local_limiter.current if any(s.is_local for s in self.states) else 0
+        return max(1, min(MAX_TOTAL_CONCURRENCY, PER_SERVER_CONCURRENCY * remote + local))
 
 
 def _headers() -> Dict[str, str]:
@@ -797,6 +835,8 @@ def _headers() -> Dict[str, str]:
 async def check_server(session: aiohttp.ClientSession, url: str) -> Dict[str, Any]:
     """Probe /health (preferred) or / for a render server."""
     info: Dict[str, Any] = {"url": url, "ok": False, "latency": None, "version": None, "active": None}
+    if url == LOCAL_TTS_URL:
+        return await local_engine_health()
     if not normalize_server_url(url):
         return info
     t0 = time.time()
@@ -834,6 +874,239 @@ _server_slots: Dict[str, asyncio.Semaphore] = {}
 _network_slots = asyncio.Semaphore(MAX_TOTAL_CONCURRENCY)
 
 
+# =============================================================================
+# Built-in FREE Edge-TTS engine (runs inside the bot, no API key)
+# =============================================================================
+class ThrottleError(RuntimeError):
+    """Raised when Microsoft's free endpoint rejects / throttles a request."""
+
+
+def _is_throttle_error(exc: BaseException) -> bool:
+    """Classify edge-tts / aiohttp failures that indicate rate limiting."""
+    name = type(exc).__name__
+    text = str(exc).lower()
+    if isinstance(exc, ThrottleError):
+        return True
+    if "403" in text or "429" in text or "too many" in text or "throttl" in text:
+        return True
+    if name in {"WSServerHandshakeError", "ClientResponseError", "ClientConnectorError",
+                "ServerDisconnectedError", "WebSocketError", "NoAudioReceived", "ClientOSError"}:
+        return True
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    return False
+
+
+class AdaptiveLimiter:
+    """Semaphore-like limiter whose capacity shrinks on throttling and grows when healthy.
+
+    * Only `current` coroutines may synthesise at the same time.
+    * New connections are spaced at least `min_gap` seconds apart (burst protection).
+    * After a throttle signal the capacity halves and a cool-down starts.
+    * After `grow_after` consecutive successes the capacity grows by one, up to `maximum`.
+    """
+
+    def __init__(self, start: int, maximum: int, min_gap: float) -> None:
+        self.maximum = max(1, maximum)
+        self.current = max(1, min(start, self.maximum))
+        self.min_gap = max(0.0, min_gap)
+        self.grow_after = 12
+        self._active = 0
+        self._streak = 0
+        self._last_start = 0.0
+        self._cooldown_until = 0.0
+        self._cond: Optional[asyncio.Condition] = None
+        self._gap_lock: Optional[asyncio.Lock] = None
+        self.throttle_events = 0
+
+    # Lazily create primitives on the running loop (safe for import-time construction).
+    def _ensure(self) -> None:
+        if self._cond is None:
+            self._cond = asyncio.Condition()
+            self._gap_lock = asyncio.Lock()
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    async def acquire(self, cancel: Optional[asyncio.Event] = None) -> None:
+        self._ensure()
+        assert self._cond is not None and self._gap_lock is not None
+        async with self._cond:
+            while self._active >= self.current:
+                if cancel is not None and cancel.is_set():
+                    raise asyncio.CancelledError
+                try:
+                    await asyncio.wait_for(self._cond.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+            self._active += 1
+        # Serialise connection starts so we never fire a burst at the endpoint.
+        async with self._gap_lock:
+            now = time.monotonic()
+            wait = max(self._cooldown_until - now, self._last_start + self.min_gap - now)
+            if wait > 0:
+                if cancel is not None:
+                    await cancellable_sleep(wait, cancel)
+                else:
+                    await asyncio.sleep(wait)
+            self._last_start = time.monotonic()
+
+    async def release(self) -> None:
+        self._ensure()
+        assert self._cond is not None
+        async with self._cond:
+            self._active = max(0, self._active - 1)
+            self._cond.notify_all()
+
+    def report_success(self) -> None:
+        self._streak += 1
+        if self._streak >= self.grow_after and self.current < self.maximum:
+            self.current += 1
+            self._streak = 0
+            log.info("Edge-TTS healthy - concurrency raised to %d", self.current)
+
+    def report_throttle(self) -> float:
+        """Shrink capacity; return the back-off delay the caller should sleep."""
+        self._streak = 0
+        self.throttle_events += 1
+        new = max(1, self.current // 2)
+        if new != self.current:
+            log.warning("Edge-TTS throttling detected - concurrency lowered %d -> %d", self.current, new)
+        self.current = new
+        pause = min(30.0, 2.0 * self.throttle_events) + random.uniform(0.0, 1.0)
+        self._cooldown_until = max(self._cooldown_until, time.monotonic() + pause)
+        return pause
+
+    def report_ok_window(self) -> None:
+        """Forget old throttle events once traffic has been clean for a while."""
+        if self._streak >= self.grow_after * 2:
+            self.throttle_events = 0
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {"active": self._active, "limit": self.current, "max": self.maximum,
+                "throttle_events": self.throttle_events}
+
+
+local_limiter = AdaptiveLimiter(LOCAL_TTS_CONCURRENCY, LOCAL_TTS_MAX_CONCURRENCY, LOCAL_TTS_MIN_GAP)
+
+
+def _make_local_communicate(text: str, voice: str, rate: str, pitch: str, volume: str):
+    """Build edge_tts.Communicate across edge-tts versions (boundary/pitch kwargs are newer)."""
+    assert edge_tts is not None
+    try:
+        return edge_tts.Communicate(text, voice, rate=rate, pitch=pitch, volume=volume,
+                                    boundary="WordBoundary", connect_timeout=15, receive_timeout=60)
+    except TypeError:
+        pass
+    try:
+        return edge_tts.Communicate(text, voice, rate=rate, pitch=pitch, volume=volume)
+    except TypeError:
+        return edge_tts.Communicate(text, voice, rate=rate, volume=volume)
+
+
+async def _local_synth_once(text: str, settings: Dict[str, Any]) -> Tuple[bytes, int]:
+    communicate = _make_local_communicate(text, settings["voice"], settings["rate"],
+                                          settings["pitch"], settings["volume"])
+    audio = bytearray()
+    duration_ms = 0
+    async for chunk in communicate.stream():
+        ctype = chunk.get("type")
+        if ctype == "audio":
+            audio.extend(chunk["data"])
+        elif ctype in ("WordBoundary", "SentenceBoundary"):
+            start = chunk.get("offset", 0) / 10_000
+            dur = chunk.get("duration", 0) / 10_000
+            duration_ms = max(duration_ms, int(start + dur))
+    if len(audio) < 100:
+        raise ThrottleError("Edge-TTS returned no audio (endpoint may be throttling)")
+    return bytes(audio), duration_ms
+
+
+async def local_synthesize(text: str, settings: Dict[str, Any], cancel: asyncio.Event,
+                           attempts: int = LOCAL_TTS_RETRIES) -> Tuple[Optional[bytes], int]:
+    """Synthesise one chunk with the free Edge-TTS endpoint.
+
+    Uses the adaptive limiter so we stay fast but under Microsoft's per-IP limits,
+    and retries with exponential back-off + jitter on throttle-like errors.
+    """
+    if not LOCAL_TTS_ENABLED:
+        return None, 0
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, attempts + 1):
+        if cancel.is_set():
+            raise asyncio.CancelledError
+        await local_limiter.acquire(cancel)
+        pause = 0.0
+        try:
+            audio, dur = await asyncio.wait_for(_local_synth_once(text, settings), timeout=LOCAL_TTS_TIMEOUT)
+            local_limiter.report_success()
+            local_limiter.report_ok_window()
+            if dur <= 0:
+                dur = max(1, round(estimate_seconds(len(text), settings["rate"]) * 1000))
+            return audio, dur
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if _is_throttle_error(exc):
+                pause = local_limiter.report_throttle()
+            log.warning("Edge-TTS attempt %d/%d failed (%s): %s", attempt, attempts, type(exc).__name__,
+                        str(exc)[:160])
+        finally:
+            await local_limiter.release()
+        if attempt < attempts:
+            backoff = min(45.0, (1.5 ** attempt) + pause + random.uniform(0.2, 1.2))
+            await cancellable_sleep(backoff, cancel)
+    log.error("Edge-TTS chunk failed after %d attempts: %s", attempts, last_exc)
+    return None, 0
+
+
+async def local_voice_exists(voice: str) -> Optional[bool]:
+    """Validate a voice id against Microsoft's catalogue (None if unavailable)."""
+    if not LOCAL_TTS_ENABLED:
+        return None
+    try:
+        voices = await asyncio.wait_for(edge_tts.list_voices(), timeout=30)
+        return any(v.get("ShortName") == voice for v in voices)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def local_engine_health() -> Dict[str, Any]:
+    """Tiny synthesis probe used by /servers and the admin panel."""
+    info: Dict[str, Any] = {"url": LOCAL_TTS_URL, "ok": False, "latency": None,
+                            "version": getattr(edge_tts, "__version__", None) if edge_tts else None,
+                            "active": local_limiter.active, "max_text_length": LOCAL_TTS_CHUNK_SIZE}
+    if not LOCAL_TTS_ENABLED:
+        return info
+    t0 = time.time()
+    try:
+        await local_limiter.acquire()
+        try:
+            audio, _ = await asyncio.wait_for(
+                _local_synth_once("OK", {"voice": DEFAULT_VOICE, "rate": "+0%", "pitch": "+0Hz", "volume": "+0%"}),
+                timeout=30)
+        finally:
+            await local_limiter.release()
+        info["ok"] = bool(audio)
+        info["latency"] = round(time.time() - t0, 2)
+        local_limiter.report_success()
+    except Exception as exc:  # noqa: BLE001
+        info["latency"] = round(time.time() - t0, 2)
+        if _is_throttle_error(exc):
+            local_limiter.report_throttle()
+    return info
+
+
+def backend_urls(remote: List[str]) -> List[str]:
+    """Remote render servers first (they spread the load over many IPs), local engine last."""
+    urls = [u for u in remote if u]
+    if LOCAL_TTS_ENABLED:
+        urls.append(LOCAL_TTS_URL)
+    return urls
+
+
 async def cancellable_sleep(seconds: float, cancel: asyncio.Event):
     try:
         await asyncio.wait_for(cancel.wait(), timeout=max(0.001, seconds))
@@ -862,6 +1135,22 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
             delay = server.cooldown_until - time.time()
             if delay > 0:
                 await cancellable_sleep(delay, cancel)
+            if server.is_local:
+                # Built-in free Edge-TTS engine: no HTTP hop, adaptive throttle-safe limiter.
+                if len(chunk) > LOCAL_TTS_CHUNK_SIZE:
+                    rejected.add(server.url)
+                    continue
+                t0 = time.monotonic()
+                data, dur = await local_synthesize(chunk, settings, cancel)
+                if data:
+                    pool.report(server, True, time.monotonic() - t0)
+                    return index, data, dur
+                pool.report(server, False)
+                if len(pool.states) == 1:
+                    # Nothing else to fail over to; the engine already retried internally.
+                    break
+                rejected.add(server.url)
+                continue
             slots = _server_slots.setdefault(server.url, asyncio.Semaphore(PER_SERVER_CONCURRENCY))
             t0 = time.monotonic()
             retry_after = min(10, 1.5 * attempt)
@@ -1113,7 +1402,7 @@ HELP_TEXT = (
     "❓ **How to use AudioBook Pro**\n\n"
     "1. Send a document: `.txt` `.md` `.docx` `.html` `.epub` `.pdf` (max 50 MB)\n"
     "   — or simply paste text as a message.\n"
-    "2. The bot extracts the text, splits it smartly and synthesises it on the render servers.\n"
+    "2. The bot extracts the text, splits it smartly and synthesises it with Microsoft Edge neural voices.\n"
     "3. You receive MP3 parts as they are finished.\n\n"
     "**Commands**\n"
     "/start – main menu\n"
@@ -1171,9 +1460,12 @@ async def cmd_status(client: Client, message: Message):
     if not db.is_approved(uid):
         return
     servers = db.servers()
+    engine = (f"built-in Edge-TTS (free, {local_limiter.current}x parallel)" if LOCAL_TTS_ENABLED
+              else "render servers only")
     text = (f"🤖 **Bot Status**\n\n"
             f"Version: `{VERSION}`\n"
             f"Uptime: `{fmt_duration(time.time() - BOT_START)}`\n"
+            f"TTS engine: `{engine}`\n"
             f"Render servers: `{len(servers)}`\n"
             f"Running jobs: `{len(active_jobs)}/{MAX_PARALLEL_JOBS}`\n"
             f"ffmpeg: `{'available' if FFMPEG else 'not installed'}`")
@@ -1443,9 +1735,9 @@ async def cb_reset_settings(client: Client, cq: CallbackQuery):
 
 async def send_voice_preview(client: Client, chat_id: int, uid: int, reply_to: Optional[Message] = None):
     settings = db.get_settings(uid)
-    servers = db.servers()
+    servers = backend_urls(db.servers())
     if not servers:
-        await safe_send(client, chat_id, "❌ No render servers configured. Ask the administrator.")
+        await safe_send(client, chat_id, "❌ No TTS engine available. Ask the administrator.")
         return
     sample = ("Hello! This is a preview of your selected voice. "
               "नमस्ते! यह आपकी चुनी हुई आवाज़ का एक नमूना है।")
@@ -1457,7 +1749,7 @@ async def send_voice_preview(client: Client, chat_id: int, uid: int, reply_to: O
     async with aiohttp.ClientSession() as session:
         _, data, dur = await fetch_chunk(session, pool, sample, 0, settings, asyncio.Semaphore(1), asyncio.Event())
     if not data:
-        await safe_send(client, chat_id, "❌ Preview failed — all render servers are unreachable right now.")
+        await safe_send(client, chat_id, "❌ Preview failed — the TTS engine is unreachable right now. Try again in a minute.")
         return
     fd, path = tempfile.mkstemp(prefix=f"preview_{uid}_", suffix=".mp3")
     with os.fdopen(fd, "wb") as f:
@@ -1617,25 +1909,31 @@ async def cb_del_server(client: Client, cq: CallbackQuery):
 async def btn_server_status(client: Client, message: Message):
     if not _is_admin_msg(message):
         return
-    servers = db.servers()
+    servers = backend_urls(db.servers())
     if not servers:
-        await message.reply("No servers configured. Use ➕ Add Server.")
+        await message.reply("No TTS engine available. Use ➕ Add Server or install `edge-tts` on the bot host.")
         return
-    msg = await message.reply(f"🔄 Checking {len(servers)} server(s)…")
+    msg = await message.reply(f"🔄 Checking {len(servers)} engine(s)…")
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(*(check_server(session, s) for s in servers))
-    lines = [f"🌐 **Server Status** ({len(servers)} total)\n"]
+    lines = [f"🌐 **TTS Engine Status** ({len(servers)} total)\n"]
     online = 0
     for i, r in enumerate(results, 1):
-        db.server_health(r["url"], r["ok"])
+        is_local = r["url"] == LOCAL_TTS_URL
+        if not is_local:
+            db.server_health(r["url"], r["ok"])
+        label = "built-in Edge-TTS (free)" if is_local else r["url"]
         if r["ok"]:
             online += 1
             extra = f" · {r['latency']}s" if r["latency"] is not None else ""
             extra += f" · v{r['version']}" if r["version"] else ""
             extra += f" · {r['active']} active" if r["active"] is not None else ""
-            lines.append(f"{i}. 🟢 `{r['url']}`{extra}")
+            if is_local:
+                snap = local_limiter.snapshot()
+                extra += f" · limit {snap['limit']}/{snap['max']} · throttles {snap['throttle_events']}"
+            lines.append(f"{i}. 🟢 `{label}`{extra}")
         else:
-            lines.append(f"{i}. 🔴 `{r['url']}` — offline")
+            lines.append(f"{i}. 🔴 `{label}` — offline")
     lines.append(f"\n✅ Online: **{online}/{len(servers)}**")
     await safe_edit(msg, "\n".join(lines))
 
@@ -1844,10 +2142,10 @@ async def text_handler(client: Client, message: Message):
         if not VOICE_RE.match(voice):
             await message.reply("❌ That does not look like a valid voice ID (example: `en-AU-NatashaNeural`).")
             return
-        # Validate against a render server if possible
+        # Validate against Microsoft's catalogue (built-in engine) or a render server
         servers = db.servers()
-        exists: Optional[bool] = None
-        if servers:
+        exists: Optional[bool] = await local_voice_exists(voice)
+        if exists is None and servers:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(f"{servers[0]}/voices", params={"q": voice}, headers=_headers(),
@@ -1858,7 +2156,7 @@ async def text_handler(client: Client, message: Message):
             except Exception:
                 exists = None
         if exists is False:
-            await message.reply("❌ This voice is not available on the render servers. Try another one.")
+            await message.reply("❌ This voice is not available in Edge-TTS. Try another one.")
             return
         db.set_setting(uid, "voice", voice)
         admin_states.pop(uid, None)
@@ -1939,8 +2237,8 @@ async def handle_document(client: Client, message: Message):
     if not db.is_approved(uid):
         await message.reply("🔒 You do not have access. Tap **🔑 Request Access**.", reply_markup=main_keyboard(uid))
         return
-    if not db.servers():
-        await message.reply("❌ No render servers are configured. Please contact the administrator.")
+    if not backend_urls(db.servers()):
+        await message.reply("❌ No TTS engine is available. Please contact the administrator.")
         return
 
     doc = message.document
@@ -2041,8 +2339,8 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: str
     try:
         if not db.is_approved(uid):
             raise ValueError("Your access has expired or was revoked")
-        if not db.servers():
-            raise ValueError("No render servers are configured")
+        if not backend_urls(db.servers()):
+            raise ValueError("No TTS engine is available")
         text = clean_text(text)
         if not text or len(text) > MAX_EXTRACTED_CHARS:
             raise ValueError(f"Text must contain 1 to {MAX_EXTRACTED_CHARS:,} characters")
@@ -2090,13 +2388,16 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: str
             if not db.is_approved(uid):
                 raise ValueError("Access expired while waiting in the queue")
             job.started = time.time()
-            servers = db.servers()
+            servers = backend_urls(db.servers())
             pool = ServerPool(servers)
             conn = aiohttp.TCPConnector(limit=pool.concurrency() + 5)
             async with aiohttp.ClientSession(connector=conn) as session:
-                await safe_edit(status, "Checking render servers and planning audio...", cancel_markup)
-                probes = await asyncio.gather(*(check_server(session, url) for url in servers))
+                await safe_edit(status, "Checking TTS engines and planning audio...", cancel_markup)
+                remote = [u for u in servers if u != LOCAL_TTS_URL]
+                probes = await asyncio.gather(*(check_server(session, url) for url in remote))
                 limits = [r["max_text_length"] for r in probes if r.get("max_text_length")]
+                if LOCAL_TTS_ENABLED:
+                    limits.append(LOCAL_TTS_CHUNK_SIZE)
                 chunk_limit = min([CHUNK_SIZE] + limits)
                 chapters = split_chapters(text) if settings["split_mode"] == "chapter" else [("Audiobook", text)]
                 plan = [(label, split_text(body, chunk_limit)) for label, body in chapters]
@@ -2208,10 +2509,14 @@ async def main() -> None:
         started = True
         db.execute("UPDATE jobs SET status = 'interrupted', finished_at = ? WHERE status = 'running'", (now_str(),))
         me = await bot.get_me()
-        log.info("AudioBook Pro v%s started as @%s (owner=%s, servers=%d)",
-                 VERSION, me.username, OWNER_ID, len(db.servers()))
+        log.info("AudioBook Pro v%s started as @%s (owner=%s, servers=%d, local_edge_tts=%s x%d..%d)",
+                 VERSION, me.username, OWNER_ID, len(db.servers()), LOCAL_TTS_ENABLED,
+                 LOCAL_TTS_CONCURRENCY, LOCAL_TTS_MAX_CONCURRENCY)
         pinger = asyncio.create_task(keep_alive_loop())
-        await safe_send(bot, OWNER_ID, f"AudioBook Pro v{VERSION} is online. Servers: {len(db.servers())}")
+        engine = (f"built-in Edge-TTS (free, {LOCAL_TTS_CONCURRENCY}-{LOCAL_TTS_MAX_CONCURRENCY}x parallel)"
+                  if LOCAL_TTS_ENABLED else "render servers only")
+        await safe_send(bot, OWNER_ID, f"AudioBook Pro v{VERSION} is online.\nEngine: {engine}\n"
+                                       f"Render servers: {len(db.servers())}")
         from pyrogram import idle
         await idle()
     finally:

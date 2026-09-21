@@ -15,6 +15,8 @@ services:
       - key: API_KEY
         sync: false
       - key: MAX_CONCURRENCY
-        value: "6"
+        value: "4"
+      - key: MIN_START_GAP_MS
+        value: "200"
       - key: TRUST_PROXY_HOPS
         value: "1"
