@@ -125,7 +125,7 @@ except ImportError:  # pragma: no cover
 # =============================================================================
 # Configuration
 # =============================================================================
-VERSION = "3.3.0"
+VERSION = "4.1.0"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -150,19 +150,58 @@ CONTACT_USERNAME = _env("CONTACT_USERNAME", "Niteshbhumihar")
 TTS_API_KEY = _env("TTS_API_KEY", "") or _env("API_KEY", "")
 
 CHUNK_SIZE = max(500, min(_env_int("CHUNK_SIZE", 3000), 6000))
-PER_SERVER_CONCURRENCY = max(1, _env_int("PER_SERVER_CONCURRENCY", 4))
-MAX_TOTAL_CONCURRENCY = 30
+# Render free instances share egress IP ranges that Microsoft throttles quickly
+# ("NoAudioReceived" on every chunk).  Start gently and let the per-server
+# limiter grow to PER_SERVER_MAX_CONCURRENCY while the server stays healthy.
+PER_SERVER_CONCURRENCY = max(1, min(_env_int("PER_SERVER_CONCURRENCY", 3), 8))
+PER_SERVER_MAX_CONCURRENCY = max(PER_SERVER_CONCURRENCY, min(_env_int("PER_SERVER_MAX_CONCURRENCY", 6), 8))
+# Hard ceiling on in-flight requests across ALL engines; with many render servers
+# this is the only cap (each server also has its own adaptive limiter).
+MAX_TOTAL_CONCURRENCY = max(4, min(_env_int("MAX_TOTAL_CONCURRENCY", 64), 256))
 MAX_PARALLEL_JOBS = max(1, _env_int("MAX_PARALLEL_JOBS", 1))
+# Attempts per *round* on the engines before the job pauses (it never gives up on
+# its own - see JOB_MAX_STALL_MINUTES).
 MAX_CHUNK_ATTEMPTS = 4
 CHUNK_TIMEOUT = 240  # seconds per TTS request
-KEEP_ALIVE_INTERVAL = 300  # seconds
+KEEP_ALIVE_INTERVAL = max(60, _env_int("KEEP_ALIVE_INTERVAL", 300))  # seconds
+# "always": ping every render server around the clock (keeps Render free
+# instances awake but burns their free hours); "jobs": only while a job runs.
+KEEP_ALIVE_MODE = _env("KEEP_ALIVE_MODE", "always").lower()
+# Optional HTTP health endpoint so the bot itself can run as a Render/Koyeb
+# *web* service (they require a bound port).  Render sets PORT automatically.
+BOT_PORT = _env_int("BOT_PORT", _env_int("PORT", 0))
+# Public URL of the bot service; it pings itself so a free web service is never
+# put to sleep in the middle of a long audiobook.  Render sets RENDER_EXTERNAL_URL.
+SELF_URL = _env("SELF_URL") or _env("RENDER_EXTERNAL_URL")
+# Refuse to start a job when the disk has less than this much free space
+# (one 12 h MP3 part at 48 kbit/s is ~260 MB; a 20 MB Hindi EPUB spans several).
+MIN_FREE_DISK_MB = max(0, _env_int("MIN_FREE_DISK_MB", 400))
 DB_PATH = _env("DB_PATH", "bot_database.db")
 SESSION_NAME = _env("SESSION_NAME", "audiobook_pro_bot")
-MAX_FILE_MB = 50
-MAX_EXTRACTED_CHARS = max(1000, _env_int("MAX_EXTRACTED_CHARS", 2_000_000))
-MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
+MAX_FILE_MB = max(1, _env_int("MAX_FILE_MB", 200))
+# 20 MB Hindi EPUBs can contain 5-10 million characters; the extractor streams
+# the text into the chunk plan so this is only a sanity cap, not a memory limit.
+MAX_EXTRACTED_CHARS = max(1000, _env_int("MAX_EXTRACTED_CHARS", 50_000_000))
+MAX_ARCHIVE_BYTES = 800 * 1024 * 1024
 MAX_AUDIO_BYTES = 1900 * 1024 * 1024  # below Telegram's 2 GB limit
 MAX_QUEUED_JOBS = max(MAX_PARALLEL_JOBS, _env_int("MAX_QUEUED_JOBS", 20))
+
+# --- Never-give-up job engine ------------------------------------------------
+# Every chunk's audio is checkpointed to disk (JOBS_DIR) and the job row in the
+# database remembers how far it got, so a bot restart / Render sleep resumes the
+# job instead of losing hours of synthesis.  When *every* engine fails at the
+# same time (Microsoft throttling all IPs at once) the job PAUSES with an
+# escalating back-off and keeps retrying instead of dying.
+JOBS_DIR = _env("JOBS_DIR", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)) or ".", "jobs"))
+# 0 = wait forever for the engines to come back (only /cancel stops the job).
+JOB_MAX_STALL_MINUTES = max(0, _env_int("JOB_MAX_STALL_MINUTES", 0))
+# Escalating pause (seconds) between rounds when all engines are failing.
+STALL_BACKOFF_STEPS = [5, 10, 20, 30, 60, 90, 120, 180, 300]
+# Resume unfinished jobs automatically after the bot restarts.
+RESUME_ON_START = os.getenv("RESUME_ON_START", "true").strip().lower() in ("1", "true", "yes", "on")
+# Text is streamed through the planner in slices of this many characters so a
+# 10-million-character book never needs to be held twice in memory.
+PLAN_SLICE_CHARS = 200_000
 
 # --- Built-in free Edge-TTS engine -------------------------------------------
 # Microsoft's free endpoint silently throttles (HTTP 403 / closed websockets)
@@ -373,6 +412,15 @@ class Database:
             self._ensure_column("user_settings", col, decl)
         for col, decl in [("added_at", "TEXT"), ("fail_count", "INTEGER DEFAULT 0"), ("last_ok", "TEXT")]:
             self._ensure_column("render_servers", col, decl)
+        # v4: resumable jobs.  The source text lives in JOBS_DIR/<job_id>/source.txt,
+        # each finished chunk in JOBS_DIR/<job_id>/chunks/NNNNNN.mp3.
+        for col, decl in [("title", "TEXT"), ("chat_id", "INTEGER"), ("status_msg_id", "INTEGER"),
+                          ("settings_json", "TEXT"), ("total_chunks", "INTEGER DEFAULT 0"),
+                          ("done_chunks", "INTEGER DEFAULT 0"), ("next_write", "INTEGER DEFAULT 0"),
+                          ("delivered_chars", "INTEGER DEFAULT 0"), ("last_progress_at", "TEXT"),
+                          ("stall_note", "TEXT"), ("resumes", "INTEGER DEFAULT 0")]:
+            self._ensure_column("jobs", col, decl)
+        self.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
 
         # normalise legacy server URLs that were stored with a trailing /tts
         for row in self.fetchall("SELECT id, url FROM render_servers"):
@@ -515,6 +563,38 @@ class Database:
     def job_finish(self, job_id: int, status: str, parts: int, seconds: int) -> None:
         self.execute("UPDATE jobs SET status = ?, parts = ?, audio_seconds = ?, finished_at = ? WHERE id = ?",
                      (status, parts, seconds, now_str(), job_id))
+
+    # -- resumable job checkpoints (v4) --------------------------------------
+    def job_init_resume(self, job_id: int, title: str, chat_id: int, status_msg_id: Optional[int],
+                        settings: Dict[str, Any], total_chunks: int) -> None:
+        self.execute("UPDATE jobs SET title = ?, chat_id = ?, status_msg_id = ?, settings_json = ?, "
+                     "total_chunks = ?, last_progress_at = ? WHERE id = ?",
+                     (title[:120], chat_id, status_msg_id, json.dumps(settings), total_chunks, now_str(), job_id))
+
+    def job_checkpoint(self, job_id: int, next_write: int, done_chunks: int, parts: int,
+                       seconds: int, delivered_chars: int, note: str = "") -> None:
+        self.execute("UPDATE jobs SET next_write = ?, done_chunks = ?, parts = ?, audio_seconds = ?, "
+                     "delivered_chars = ?, last_progress_at = ?, stall_note = ? WHERE id = ?",
+                     (next_write, done_chunks, parts, seconds, delivered_chars, now_str(), note[:200], job_id))
+
+    def job_set_status(self, job_id: int, status: str, note: str = "") -> None:
+        self.execute("UPDATE jobs SET status = ?, stall_note = ? WHERE id = ?", (status, note[:200], job_id))
+
+    def job_get(self, job_id: int) -> Optional[sqlite3.Row]:
+        return self.fetchone("SELECT * FROM jobs WHERE id = ?", (job_id,))
+
+    def resumable_jobs(self) -> List[sqlite3.Row]:
+        """Jobs interrupted by a restart that still have their source text on disk."""
+        return self.fetchall("SELECT * FROM jobs WHERE status IN ('running', 'paused', 'interrupted') "
+                             "AND chat_id IS NOT NULL AND settings_json IS NOT NULL ORDER BY id")
+
+    def user_resumable_job(self, user_id: int) -> Optional[sqlite3.Row]:
+        return self.fetchone("SELECT * FROM jobs WHERE user_id = ? AND status IN ('paused', 'interrupted') "
+                             "AND chat_id IS NOT NULL AND settings_json IS NOT NULL ORDER BY id DESC LIMIT 1",
+                             (user_id,))
+
+    def running_jobs(self) -> List[sqlite3.Row]:
+        return self.fetchall("SELECT * FROM jobs WHERE status IN ('running', 'paused') ORDER BY id")
 
     def job_history(self, user_id: int, limit: int = 10) -> List[sqlite3.Row]:
         return self.fetchall("SELECT * FROM jobs WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit))
@@ -664,12 +744,62 @@ def _html_to_text(markup: Any) -> str:
     return soup.get_text(separator="\n")
 
 
+def extract_text_to_file(path: str, ext: str, out_path: str) -> int:
+    """Stream-extract a document into ``out_path`` (UTF-8) and return the char count.
+
+    Runs in a worker thread.  EPUB / PDF are processed item-by-item and written
+    as we go, so a 20 MB book with millions of characters never has to be held
+    in memory as one giant string (the old ``"\\n".join(texts)`` doubled RAM).
+    Each written piece is already passed through :func:`clean_text`.
+    """
+    total = 0
+    with open(out_path, "w", encoding="utf-8") as out:
+        def emit(piece: str) -> None:
+            nonlocal total
+            piece = clean_text(piece)
+            if not piece:
+                return
+            if total:
+                out.write("\n\n")
+                total += 2
+            out.write(piece)
+            total += len(piece)
+            if total > MAX_EXTRACTED_CHARS:
+                raise ValueError(f"Document exceeds the {MAX_EXTRACTED_CHARS:,} character limit")
+
+        if ext in {".epub", ".docx"}:
+            with zipfile.ZipFile(path) as archive:
+                members = archive.infolist()
+                if len(members) > 20000 or sum(m.file_size for m in members) > MAX_ARCHIVE_BYTES:
+                    raise ValueError("Expanded document is too large")
+        if ext == ".epub":
+            if epub is None:
+                raise RuntimeError("ebooklib is not installed on the bot server")
+            book = epub.read_epub(path, options={"ignore_ncx": True}) \
+                if "options" in epub.read_epub.__code__.co_varnames else epub.read_epub(path)
+            spine_ids = [item[0] for item in getattr(book, "spine", [])]
+            items = {it.get_id(): it for it in book.get_items() if it.get_type() == ebooklib.ITEM_DOCUMENT}
+            ordered = [items[i] for i in spine_ids if i in items] + [it for k, it in items.items() if k not in spine_ids]
+            for it in ordered:
+                emit(_html_to_text(it.get_body_content()))
+            return total
+        if ext == ".pdf":
+            if PdfReader is None:
+                raise RuntimeError("pypdf is not installed on the bot server")
+            reader = PdfReader(path)
+            for page in reader.pages:
+                emit(page.extract_text() or "")
+            return total
+        emit(extract_text(path, ext))
+    return total
+
+
 def extract_text(path: str, ext: str) -> str:
     """Extract plain text from a supported document (runs in a worker thread)."""
     if ext in {".epub", ".docx"}:
         with zipfile.ZipFile(path) as archive:
             members = archive.infolist()
-            if len(members) > 10000 or sum(m.file_size for m in members) > MAX_ARCHIVE_BYTES:
+            if len(members) > 20000 or sum(m.file_size for m in members) > MAX_ARCHIVE_BYTES:
                 raise ValueError("Expanded document is too large")
     if ext in (".txt", ".md"):
         return _read_text_file(path)
@@ -798,6 +928,59 @@ def split_text_for_tts(text: str, max_chars: int, max_bytes: Optional[int] = Non
     return [c for c in out if c.strip()]
 
 
+def iter_text_slices(text: str, slice_chars: int = PLAN_SLICE_CHARS):
+    """Yield ``text`` in slices that end on a paragraph boundary when possible."""
+    n = len(text)
+    pos = 0
+    while pos < n:
+        end = min(n, pos + slice_chars)
+        if end < n:
+            cut = text.rfind("\n\n", pos + slice_chars // 2, end)
+            if cut == -1:
+                cut = text.rfind("\n", pos + slice_chars // 2, end)
+            if cut == -1:
+                cut = text.rfind(" ", pos + slice_chars // 2, end)
+            if cut > pos:
+                end = cut
+        yield text[pos:end]
+        pos = end
+        while pos < n and text[pos] in " \n":
+            pos += 1
+
+
+def build_plan(text: str, chunk_limit: int, max_bytes: Optional[int], chapter_mode: bool) -> List[Tuple[str, str]]:
+    """Return ``[(label, chunk_text), ...]`` for the whole book.
+
+    Chapters (optional) are detected on the full text; each chapter body is then
+    fed through the sentence/byte-aware splitter in slices so planning a
+    multi-million-character book stays memory-flat.
+    """
+    plan: List[Tuple[str, str]] = []
+    sections = split_chapters(text) if chapter_mode else [("Audiobook", text)]
+    for label, body in sections:
+        for piece in iter_text_slices(body):
+            for chunk in split_text_for_tts(piece, chunk_limit, max_bytes):
+                plan.append((label, chunk))
+    return plan
+
+
+def write_plan(plan_path: str, plan: List[Tuple[str, str]]) -> None:
+    with open(plan_path, "w", encoding="utf-8") as f:
+        for label, chunk in plan:
+            f.write(json.dumps({"l": label, "t": chunk}, ensure_ascii=False) + "\n")
+
+
+def read_plan(plan_path: str) -> List[Tuple[str, str]]:
+    plan: List[Tuple[str, str]] = []
+    with open(plan_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rec = json.loads(line)
+                plan.append((rec["l"], rec["t"]))
+    return plan
+
+
 def split_chapters(text: str) -> List[Tuple[str, str]]:
     """Return [(title, body)] using chapter headings; single entry if none found."""
     matches = list(CHAPTER_RE.finditer(text))
@@ -836,6 +1019,8 @@ class ServerState:
     latency: float = 0.0
     cooldown_until: float = 0.0
     last_error: str = ""
+    # consecutive failures (reset on success) - drives the per-server cooldown
+    streak: int = 0
 
     @property
     def label(self) -> str:
@@ -880,15 +1065,35 @@ class ServerPool:
         if ok:
             s.cooldown_until = 0
             s.successes += 1
+            s.streak = 0
             s.failures = max(0, s.failures - 1)
             s.latency = latency if not s.latency else (s.latency * 0.7 + latency * 0.3)
             s.last_error = ""
+            if not s.is_local:
+                remote_limiter(s.url).report_success()
         else:
             s.failures += 1
+            s.streak += 1
             if error:
                 s.last_error = error[:200]
-            if s.failures >= 3:
-                s.cooldown_until = time.time() + min(120, 15 * s.failures)
+            if s.streak >= 2:
+                # Escalating per-server cooldown; never permanent - the server may recover.
+                s.cooldown_until = time.time() + min(180, 10 * s.streak)
+
+    def all_cooling(self) -> bool:
+        """True when every engine is in cooldown (global throttle / outage)."""
+        now = time.time()
+        return all(s.cooldown_until > now for s in self.states)
+
+    def soonest_available(self) -> float:
+        """Seconds until at least one engine leaves cooldown (0 if one is free)."""
+        now = time.time()
+        return max(0.0, min(s.cooldown_until for s in self.states) - now)
+
+    def reset_cooldowns(self) -> None:
+        for s in self.states:
+            s.cooldown_until = 0
+            s.streak = 0
 
     def failure_summary(self) -> str:
         """Human readable 'why did every engine fail' text for error messages."""
@@ -898,20 +1103,21 @@ class ServerPool:
         return "; ".join(parts)
 
     def concurrency(self) -> int:
-        remote = sum(1 for s in self.states if not s.is_local)
+        remote = sum(remote_limiter(s.url).current for s in self.states if not s.is_local)
         local = local_limiter.current if any(s.is_local for s in self.states) else 0
-        return max(1, min(MAX_TOTAL_CONCURRENCY, PER_SERVER_CONCURRENCY * remote + local))
+        return max(1, min(MAX_TOTAL_CONCURRENCY, remote + local))
 
     def max_concurrency(self) -> int:
         """Upper bound used to size the request pipeline.
 
-        The real per-engine throttles (``local_limiter`` / ``_server_slots``) are
+        The real per-engine throttles (``local_limiter`` / ``remote_limiter``) are
         enforced inside ``fetch_chunk``; this only has to be large enough that the
-        adaptive limiter can actually grow up to its ceiling mid-job.
+        adaptive limiters can actually grow up to their ceilings mid-job.  It scales
+        linearly with the number of servers: more IPs = more total throughput.
         """
-        remote = sum(1 for s in self.states if not s.is_local)
+        remote = sum(remote_limiter(s.url).maximum for s in self.states if not s.is_local)
         local = local_limiter.maximum if any(s.is_local for s in self.states) else 0
-        return max(1, min(MAX_TOTAL_CONCURRENCY, PER_SERVER_CONCURRENCY * remote + local))
+        return max(1, min(MAX_TOTAL_CONCURRENCY, remote + local))
 
 
 def _headers() -> Dict[str, str]:
@@ -942,15 +1148,24 @@ async def _describe_http_error(resp: aiohttp.ClientResponse) -> str:
         return "HTTP 404: /tts endpoint not found (is this really an app.py render server?)"
     if resp.status == 429:
         return f"HTTP 429: rate limited{(' - ' + detail) if detail else ''}"
+    if resp.status in (502, 503, 504):
+        if "noaudio" in detail.lower().replace(" ", "") or "no audio" in detail.lower():
+            return f"HTTP {resp.status}: Microsoft Edge endpoint is throttling this server's IP (no audio) - will retry"
+        return f"HTTP {resp.status}: server busy / upstream error{(' - ' + detail) if detail else ''} - will retry"
     return f"HTTP {resp.status}{(': ' + detail) if detail else ''}"
+
+
+# A realistic probe sentence (Hindi, ~120 chars).  A 2-letter "OK" probe used to
+# pass while every real chunk failed, so /servers showed 4/4 green during outages.
+PROBE_TEXT = "यह एक परीक्षण वाक्य है। इसका उपयोग यह जाँचने के लिए किया जाता है कि सर्वर सही ढंग से ऑडियो बना रहा है या नहीं।"
 
 
 async def probe_tts(session: aiohttp.ClientSession, url: str) -> Tuple[bool, str]:
     """Authenticated end-to-end /tts probe: proves the bot can actually render on this server."""
-    payload = {"text": "OK", "voice": DEFAULT_VOICE, "rate": "+0%", "pitch": "+0Hz", "volume": "+0%"}
+    payload = {"text": PROBE_TEXT, "voice": DEFAULT_VOICE, "rate": "+0%", "pitch": "+0Hz", "volume": "+0%"}
     try:
         async with session.post(f"{url}/tts", json=payload, headers=_headers(), allow_redirects=False,
-                                timeout=aiohttp.ClientTimeout(total=60)) as r:
+                                timeout=aiohttp.ClientTimeout(total=90)) as r:
             if r.status != 200:
                 return False, await _describe_http_error(r)
             data = await r.content.read(4096)
@@ -994,6 +1209,8 @@ async def check_server(session: aiohttp.ClientSession, url: str, deep: bool = Fa
                     info["version"] = j.get("version")
                     info["active"] = j.get("active_jobs")
                     info["auth_required"] = j.get("auth_required")
+                    info["throttled"] = bool(j.get("throttled"))
+                    info["queued"] = j.get("queued")
                     limit = j.get("max_text_length")
                     if isinstance(limit, int) and limit > 0:
                         info["max_text_length"] = limit
@@ -1027,7 +1244,6 @@ async def check_server(session: aiohttp.ClientSession, url: str, deep: bool = Fa
     return info
 
 
-_server_slots: Dict[str, asyncio.Semaphore] = {}
 _network_slots = asyncio.Semaphore(MAX_TOTAL_CONCURRENCY)
 
 
@@ -1146,6 +1362,20 @@ class AdaptiveLimiter:
 
 
 local_limiter = AdaptiveLimiter(LOCAL_TTS_CONCURRENCY, LOCAL_TTS_MAX_CONCURRENCY, LOCAL_TTS_MIN_GAP)
+
+# One adaptive limiter per render server.  Each server sits on its own IP and
+# has its own Edge-TTS quota, so throttling on one must not slow the others.
+_remote_limiters: Dict[str, AdaptiveLimiter] = {}
+
+
+def remote_limiter(url: str) -> AdaptiveLimiter:
+    lim = _remote_limiters.get(url)
+    if lim is None:
+        # Start at PER_SERVER_CONCURRENCY, allow growth up to 2x (max 8) while healthy.
+        lim = AdaptiveLimiter(PER_SERVER_CONCURRENCY, min(8, max(PER_SERVER_CONCURRENCY, PER_SERVER_CONCURRENCY * 2)),
+                              0.1)
+        _remote_limiters[url] = lim
+    return lim
 
 
 def _make_local_communicate(text: str, voice: str, rate: str, pitch: str, volume: str):
@@ -1268,8 +1498,8 @@ async def local_engine_health() -> Dict[str, Any]:
         await local_limiter.acquire()
         try:
             audio, _ = await asyncio.wait_for(
-                _local_synth_once("OK", {"voice": DEFAULT_VOICE, "rate": "+0%", "pitch": "+0Hz", "volume": "+0%"}),
-                timeout=30)
+                _local_synth_once(PROBE_TEXT, {"voice": DEFAULT_VOICE, "rate": "+0%", "pitch": "+0Hz", "volume": "+0%"}),
+                timeout=45)
         finally:
             await local_limiter.release()
         info["ok"] = bool(audio)
@@ -1302,7 +1532,13 @@ async def cancellable_sleep(seconds: float, cancel: asyncio.Event):
 async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: str, index: int,
                       settings: Dict[str, Any], sem: asyncio.Semaphore,
                       cancel: asyncio.Event) -> Tuple[int, Optional[bytes], int]:
-    """Retry complete chunks only: a rejection must NEVER truncate source text."""
+    """Synthesise one chunk on the best available engine, with failover.
+
+    Returns ``(index, None, 0)`` only after one *round* of attempts on every
+    engine failed; the caller (``ChunkPipeline``) then pauses the job with an
+    escalating back-off and re-queues the chunk - text is never dropped and the
+    job never gives up by itself.
+    """
     payload = {"text": chunk, "voice": settings["voice"], "rate": settings["rate"],
                "pitch": settings["pitch"], "volume": settings["volume"]}
     rejected = set()
@@ -1318,7 +1554,10 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
                 server = min(candidates, key=lambda s: (s.cooldown_until, s.score))
             delay = server.cooldown_until - time.time()
             if delay > 0:
-                await cancellable_sleep(delay, cancel)
+                # Never sleep long inside a slot: bounded wait, then let the pipeline decide.
+                await cancellable_sleep(min(delay, 10.0), cancel)
+                if server.cooldown_until > time.time() and len(candidates) > 1:
+                    server = min(candidates, key=lambda s: (s.cooldown_until, s.score))
             if server.is_local:
                 # Built-in free Edge-TTS engine: no HTTP hop, adaptive throttle-safe limiter.
                 if len(chunk) > LOCAL_TTS_CHUNK_SIZE:
@@ -1336,65 +1575,79 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
                     break
                 rejected.add(server.url)
                 continue
-            slots = _server_slots.setdefault(server.url, asyncio.Semaphore(PER_SERVER_CONCURRENCY))
+            limiter = remote_limiter(server.url)
             t0 = time.monotonic()
             retry_after = min(10, 1.5 * attempt)
+            throttled = False
             try:
-                async with slots, _network_slots:
-                    if cancel.is_set():
-                        raise asyncio.CancelledError
-                    async with session.post(server.tts_url, json=payload, headers=_headers(),
-                                            allow_redirects=False,
-                                            timeout=aiohttp.ClientTimeout(total=CHUNK_TIMEOUT)) as resp:
-                        if resp.status == 200:
-                            content_type = resp.headers.get("Content-Type", "").split(";")[0].lower()
-                            data = bytearray()
-                            async for piece in resp.content.iter_chunked(65536):
-                                data.extend(piece)
-                                if len(data) > 32 * 1024 * 1024:
-                                    raise ValueError("TTS chunk response is unexpectedly large")
-                            # Edge MP3s start with ID3 or MPEG frame sync; reject HTML/JSON 200 responses.
-                            mp3 = data.startswith(b"ID3") or (len(data) >= 2 and data[0] == 255 and data[1] & 224 == 224)
-                            if len(data) > 100 and mp3 and content_type in {"", "audio/mpeg", "audio/mp3", "application/octet-stream"}:
+                await limiter.acquire(cancel)
+                try:
+                    async with _network_slots:
+                        if cancel.is_set():
+                            raise asyncio.CancelledError
+                        async with session.post(server.tts_url, json=payload, headers=_headers(),
+                                                allow_redirects=False,
+                                                timeout=aiohttp.ClientTimeout(total=CHUNK_TIMEOUT)) as resp:
+                            if resp.status == 200:
+                                content_type = resp.headers.get("Content-Type", "").split(";")[0].lower()
+                                data = bytearray()
+                                async for piece in resp.content.iter_chunked(65536):
+                                    data.extend(piece)
+                                    if len(data) > 32 * 1024 * 1024:
+                                        raise ValueError("TTS chunk response is unexpectedly large")
+                                # Edge MP3s start with ID3 or MPEG frame sync; reject HTML/JSON 200 responses.
+                                mp3 = data.startswith(b"ID3") or (len(data) >= 2 and data[0] == 255 and data[1] & 224 == 224)
+                                if len(data) > 100 and mp3 and content_type in {"", "audio/mpeg", "audio/mp3",
+                                                                                "application/octet-stream"}:
+                                    try:
+                                        dur = int(resp.headers.get("X-Duration-Ms", "0"))
+                                    except (ValueError, TypeError):
+                                        dur = 0
+                                    if dur <= 0:
+                                        dur = max(1, round(estimate_seconds(len(chunk), settings["rate"]) * 1000))
+                                    pool.report(server, True, time.monotonic() - t0)
+                                    return index, bytes(data), dur
+                                pool.report(server, False,
+                                            error=f"HTTP 200 but body is not MP3 ({content_type or 'no content-type'}, {len(data)} bytes)")
+                            elif resp.status in (400, 401, 403, 413, 404, 405):
+                                reason = await _describe_http_error(resp)
+                                rejected.add(server.url)
+                                if resp.status in (401, 404):
+                                    # Configuration problem - this server will reject every chunk, stop hammering it.
+                                    server.cooldown_until = time.time() + 300
+                                pool.report(server, False, error=reason)
+                                log.warning("Chunk %d rejected by %s (%s); trying another server without truncation",
+                                            index, server.url, reason)
+                            elif resp.status in (429, 502, 503, 504):
+                                # 429 = our own rate limit, 502/503/504 = the server's Edge-TTS
+                                # upstream is throttled / busy.  Both mean "back off this IP".
+                                throttled = True
                                 try:
-                                    dur = int(resp.headers.get("X-Duration-Ms", "0"))
-                                except (ValueError, TypeError):
-                                    dur = 0
-                                if dur <= 0:
-                                    dur = max(1, round(estimate_seconds(len(chunk), settings["rate"]) * 1000))
-                                pool.report(server, True, time.monotonic() - t0)
-                                return index, bytes(data), dur
-                            pool.report(server, False,
-                                        error=f"HTTP 200 but body is not MP3 ({content_type or 'no content-type'}, {len(data)} bytes)")
-                        elif resp.status in (400, 401, 403, 413, 404, 405):
-                            reason = await _describe_http_error(resp)
-                            rejected.add(server.url)
-                            if resp.status in (401, 404):
-                                # Configuration problem - this server will reject every chunk, stop hammering it.
-                                server.cooldown_until = time.time() + 300
-                            pool.report(server, False, error=reason)
-                            log.warning("Chunk %d rejected by %s (%s); trying another server without truncation",
-                                        index, server.url, reason)
-                        elif resp.status == 429:
-                            try:
-                                retry_after = min(120, max(1, float(resp.headers.get("Retry-After", "5"))))
-                            except ValueError:
-                                retry_after = 5
-                            server.cooldown_until = time.time() + retry_after
-                            pool.report(server, False, error=f"HTTP 429 rate limited (retry in {retry_after:.0f}s)")
-                        else:
-                            pool.report(server, False, error=await _describe_http_error(resp))
+                                    retry_after = min(120, max(1, float(resp.headers.get("Retry-After", "5"))))
+                                except ValueError:
+                                    retry_after = 5
+                                reason = await _describe_http_error(resp)
+                                server.cooldown_until = max(server.cooldown_until, time.time() + retry_after)
+                                pool.report(server, False, error=reason)
+                            else:
+                                pool.report(server, False, error=await _describe_http_error(resp))
+                finally:
+                    await limiter.release()
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
+                throttled = True
                 pool.report(server, False, error=f"timed out after {CHUNK_TIMEOUT}s")
                 log.debug("Chunk %d attempt %d timed out on %s", index, attempt, server.url)
             except Exception as exc:
+                throttled = _is_throttle_error(exc)
                 pool.report(server, False, error=_describe_exc(exc))
                 log.debug("Chunk %d attempt %d failed on %s: %s", index, attempt, server.url, exc)
+            if throttled:
+                limiter.report_throttle()
             if attempt < MAX_CHUNK_ATTEMPTS and len(rejected) < len(pool.states):
-                await cancellable_sleep(retry_after, cancel)
-    log.error("Chunk %d failed on every engine: %s", index, pool.failure_summary())
+                await cancellable_sleep(min(retry_after, 10.0), cancel)
+    log.warning("Chunk %d failed on every engine this round: %s", index, pool.failure_summary())
     return index, None, 0
 
 
@@ -1598,16 +1851,19 @@ def approval_markup(target: int) -> InlineKeyboardMarkup:
 
 HELP_TEXT = (
     "❓ **How to use AudioBook Pro**\n\n"
-    "1. Send a document: `.txt` `.md` `.docx` `.html` `.epub` `.pdf` (max 50 MB)\n"
+    f"1. Send a document: `.txt` `.md` `.docx` `.html` `.epub` `.pdf` (max {MAX_FILE_MB} MB, any length)\n"
     "   — or simply paste text as a message.\n"
     "2. The bot extracts the text, splits it smartly and synthesises it with Microsoft Edge neural voices.\n"
-    "3. You receive MP3 parts as they are finished.\n\n"
+    "3. You receive MP3 parts as they are finished.\n"
+    "4. Big books are safe: progress is saved continuously. If the engines are throttled the job "
+    "pauses and retries by itself; if the bot restarts it resumes where it stopped.\n\n"
     "**Commands**\n"
     "/start – main menu\n"
     "/settings – voice, speed, pitch, volume, split mode\n"
     "/preview – hear a sample of your current voice\n"
     "/account – subscription & usage\n"
     "/history – your last jobs\n"
+    "/resume – continue an interrupted audiobook\n"
     "/cancel – cancel the running job\n"
     "/status – bot status\n"
     "/help – this message\n\n"
@@ -2029,6 +2285,12 @@ async def cmd_cancel(client: Client, message: Message):
         job.stop()
         await message.reply("🛑 Cancelling your job… parts already finished have been delivered.")
         return
+    # Discard an interrupted (resumable) job so the user can start over.
+    row = db.user_resumable_job(uid)
+    if row is not None:
+        db.job_finish(int(row["id"]), "cancelled", int(row["parts"] or 0), int(row["audio_seconds"] or 0))
+        shutil.rmtree(job_dir(int(row["id"])), ignore_errors=True)
+        cancelled = True
     await message.reply("✅ Cancelled." if cancelled else "Nothing to cancel.", reply_markup=main_keyboard(uid))
 
 
@@ -2127,16 +2389,27 @@ async def btn_server_status(client: Client, message: Message):
             extra = f" · {r['latency']}s" if r["latency"] is not None else ""
             extra += f" · v{r['version']}" if r["version"] else ""
             extra += f" · {r['active']} active" if r["active"] is not None else ""
+            if r.get("throttled"):
+                extra += " · ⚠️ MS throttling"
             if is_local:
                 snap = local_limiter.snapshot()
                 extra += f" · limit {snap['limit']}/{snap['max']} · throttles {snap['throttle_events']}"
             if not is_local:
+                lim = remote_limiter(r["url"]).snapshot()
+                extra += f" · limit {lim['limit']}/{lim['max']}"
+                if lim["throttle_events"]:
+                    extra += f" · throttles {lim['throttle_events']}"
                 extra += " · 🔐 auth OK" if r.get("auth_required") else " · 🔓 no key"
             lines.append(f"{i}. 🟢 `{label}`{extra}")
         else:
             reason = html.escape(r.get("error") or "offline")[:200]
             lines.append(f"{i}. 🔴 `{label}` — {reason}")
     lines.append(f"\n✅ Online: **{online}/{len(servers)}**")
+    running = db.running_jobs()
+    if running:
+        lines.append(f"🎧 Jobs in progress: {len(running)} (see /jobs)")
+    lines.append(f"\n_Probe = real {len(PROBE_TEXT)}-char Hindi synthesis on every engine. "
+                 f"Jobs never fail on a throttled engine: they pause and retry automatically._")
     if not TTS_API_KEY and any(r.get("auth_required") for r in results):
         lines.append("⚠️ A server requires an API key but `TTS_API_KEY` is not set on the bot.")
     await safe_edit(msg, "\n".join(lines))
@@ -2427,7 +2700,7 @@ async def cb_text_confirm(client: Client, cq: CallbackQuery):
     if job is None:
         await safe_edit(cq.message, "The job queue is full. Please try again later.")
         return
-    job.task = asyncio.create_task(run_audiobook_job(client, cq.message, uid, text,
+    job.task = asyncio.create_task(run_audiobook_job(client, cq.message, uid, text=text,
                                                     source="text message", title="Text", job=job))
     track_job(job)
 
@@ -2486,15 +2759,14 @@ async def document_job(client, message, job, name, ext):
             raise ValueError("Download did not complete")
         if os.path.getsize(path) > MAX_FILE_MB * 1024 * 1024:
             raise ValueError("Downloaded file exceeds the size limit")
-        await safe_edit(status, "Extracting text...")
-        extraction = asyncio.create_task(asyncio.to_thread(extract_text, path, ext))
-        text = await asyncio.shield(extraction)
-        if len(text) > MAX_EXTRACTED_CHARS:
-            raise ValueError(f"Document exceeds the {MAX_EXTRACTED_CHARS:,} character limit")
-        text = clean_text(text)
-        if not text:
+        await safe_edit(status, f"Extracting text from {fmt_size(os.path.getsize(path))} file...")
+        text_path = os.path.join(tmpdir, "source.txt")
+        # Stream-extract straight to disk: EPUB/PDF are processed item by item.
+        extraction = asyncio.create_task(asyncio.to_thread(extract_text_to_file, path, ext, text_path))
+        chars = await asyncio.shield(extraction)
+        if chars <= 0:
             raise ValueError("No readable text found. Scanned PDFs need OCR before uploading")
-        await run_audiobook_job(client, status, job.user_id, text, source=name,
+        await run_audiobook_job(client, status, job.user_id, text_path=text_path, source=name,
                                title=os.path.splitext(name)[0], job=job)
     except asyncio.CancelledError:
         if status is not None:
@@ -2520,45 +2792,176 @@ async def document_job(client, message, job, name, ext):
 
 
 # =============================================================================
-# Core audiobook job
+# Core audiobook job  (v4: resumable, never gives up, any size, any #servers)
 # =============================================================================
-async def run_audiobook_job(client: Client, status: Message, uid: int, text: str,
-                            source: str, title: str, job: Optional[Job] = None) -> None:
+def job_dir(job_id: int) -> str:
+    return os.path.join(JOBS_DIR, str(job_id))
+
+
+def chunk_path(jdir: str, index: int) -> str:
+    return os.path.join(jdir, "chunks", f"{index:06d}.mp3")
+
+
+def _read_meta(jdir: str, index: int) -> int:
+    """Duration (ms) of a checkpointed chunk, stored alongside the mp3."""
+    try:
+        with open(chunk_path(jdir, index) + ".ms", "r") as f:
+            return max(1, int(f.read().strip() or "1"))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _write_chunk(jdir: str, index: int, data: bytes, dur: int) -> None:
+    p = chunk_path(jdir, index)
+    tmp = p + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, p)
+    with open(p + ".ms", "w") as f:
+        f.write(str(dur))
+
+
+def _chunk_ready(jdir: str, index: int) -> bool:
+    p = chunk_path(jdir, index)
+    return os.path.isfile(p) and os.path.getsize(p) > 100 and os.path.isfile(p + ".ms")
+
+
+async def wait_for_engines(pool: ServerPool, session: aiohttp.ClientSession, cancel: asyncio.Event,
+                           status: Message, cancel_markup, stall_round: int, done: int, total: int,
+                           job_id: int) -> None:
+    """All engines failed in the same round: pause with escalating back-off.
+
+    Instead of killing the job we wait, re-probe the engines and continue as
+    soon as *any* of them answers again.  Only /cancel (or JOB_MAX_STALL_MINUTES)
+    stops this loop.
+    """
+    pause = STALL_BACKOFF_STEPS[min(stall_round, len(STALL_BACKOFF_STEPS) - 1)] + random.uniform(0, 3)
+    pause = max(pause, pool.soonest_available())
+    reason = pool.failure_summary()[:300]
+    log.warning("Job %s paused (round %d, %.0fs): %s", job_id, stall_round + 1, pause, reason)
+    db.job_set_status(job_id, "paused", f"round {stall_round + 1}: {reason}")
+    percent = int(done / total * 100) if total else 0
+    await safe_edit(status,
+                    f"**Generating audiobook**\n"
+                    f"[{progress_bar(percent)}] {percent}% ({done}/{total})\n\n"
+                    f"⏸ All TTS engines are busy or throttled right now.\n"
+                    f"Waiting {fmt_duration(pause)} and retrying automatically (attempt {stall_round + 1}).\n"
+                    f"Nothing is lost - the job continues from where it stopped.\n"
+                    f"Reason: {html.escape(reason)[:180]}",
+                    cancel_markup)
+    await cancellable_sleep(pause, cancel)
+    # Give every engine a fresh chance; the limiters will shrink again if needed.
+    pool.reset_cooldowns()
+    if local_limiter.throttle_events:
+        local_limiter.throttle_events = max(0, local_limiter.throttle_events - 1)
+    db.job_set_status(job_id, "running", "")
+
+
+async def run_audiobook_job(client: Client, status: Message, uid: int, text: Optional[str] = None,
+                            source: str = "", title: str = "Audiobook", job: Optional[Job] = None,
+                            text_path: Optional[str] = None, resume_job_id: Optional[int] = None) -> None:
+    """Drive one audiobook job from text (or a text file) to delivered MP3 parts.
+
+    * Chunks are synthesised through a sliding-window pipeline across every
+      engine (render servers + built-in Edge-TTS), each with its own adaptive
+      limiter - throughput scales with the number of servers.
+    * Every finished chunk is checkpointed to ``JOBS_DIR/<job>/chunks`` and the
+      cursor is saved in the database, so a restart or Render sleep resumes the
+      job instead of losing it (``resume_job_id``).
+    * When every engine fails at once the job pauses with escalating back-off
+      and keeps retrying; it never fails on its own unless
+      ``JOB_MAX_STALL_MINUTES`` is set and exceeded.
+    """
     if job is None:
         job = reserve_job(uid)
         if job is None:
             await safe_edit(status, "A job is already running or the queue is full.")
             return
         job.task = asyncio.current_task()
-    job_id = None
-    tmpdir = None
+    job_id: Optional[int] = None
+    jdir: Optional[str] = None
     delivered = delivered_chars = total_audio_ms = done_chunks = 0
     outcome = "failed"
+    keep_files = False
     started = time.monotonic()
     cancel_markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("Cancel", callback_data=f"cancel_job_{uid}")]
     ])
     settings = db.get_settings(uid)
-    max_part_ms = settings["max_hours"] * 3600 * 1000
     part_ms = part_bytes = part_chars = 0
     part_label = "Audiobook"
-    out_path = None
+    part_index = 0
+    plan: List[Tuple[str, str]] = []
+    next_write = 0
+    part_start = 0  # first chunk index of the part currently being assembled
     try:
         if not db.is_approved(uid):
             raise ValueError("Your access has expired or was revoked")
         if not backend_urls(db.servers()):
             raise ValueError("No TTS engine is available")
-        text = clean_text(text)
-        if not text or len(text) > MAX_EXTRACTED_CHARS:
-            raise ValueError(f"Text must contain 1 to {MAX_EXTRACTED_CHARS:,} characters")
-        job_id = db.job_start(uid, source, len(text))
-        tmpdir = tempfile.mkdtemp(prefix=f"abp_{uid}_{job_id}_")
-        out_path = os.path.join(tmpdir, "part.mp3")
+
+        # ------------------------------------------------------------------
+        # Job directory + source text (new job or resume)
+        # ------------------------------------------------------------------
+        os.makedirs(JOBS_DIR, exist_ok=True)
+        if resume_job_id is not None:
+            row = db.job_get(resume_job_id)
+            if row is None:
+                raise ValueError("Job to resume no longer exists")
+            job_id = int(row["id"])
+            jdir = job_dir(job_id)
+            plan_path = os.path.join(jdir, "plan.jsonl")
+            if not os.path.isfile(plan_path):
+                raise ValueError("Job files were deleted - cannot resume, please send the file again")
+            try:
+                settings = {**settings, **json.loads(row["settings_json"] or "{}")}
+            except ValueError:
+                pass
+            title = row["title"] or title
+            source = row["source"] or source
+            delivered = int(row["parts"] or 0)
+            part_index = delivered
+            total_audio_ms = int(row["audio_seconds"] or 0) * 1000
+            delivered_chars = int(row["delivered_chars"] or 0)
+            next_write = int(row["next_write"] or 0)
+            done_chunks = next_write
+            db.execute("UPDATE jobs SET resumes = COALESCE(resumes,0) + 1, status = 'running', "
+                       "status_msg_id = ? WHERE id = ?", (status.id, job_id))
+            await safe_edit(status, f"♻️ Resuming **{html.escape(title)[:60]}** from chunk {next_write + 1}…",
+                            cancel_markup)
+            plan = read_plan(plan_path)
+        else:
+            if text_path is None:
+                if text is None:
+                    raise ValueError("No text supplied")
+                text = clean_text(text)
+                if not text or len(text) > MAX_EXTRACTED_CHARS:
+                    raise ValueError(f"Text must contain 1 to {MAX_EXTRACTED_CHARS:,} characters")
+                chars = len(text)
+            else:
+                chars = os.path.getsize(text_path)  # bytes; refined below
+            job_id = db.job_start(uid, source, chars)
+            jdir = job_dir(job_id)
+            os.makedirs(os.path.join(jdir, "chunks"), exist_ok=True)
+            src_path = os.path.join(jdir, "source.txt")
+            if text_path is not None:
+                shutil.move(text_path, src_path)
+            else:
+                with open(src_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+            text = None  # free memory; we re-read from disk when planning
+
         if job_slots.locked():
             await safe_edit(status, "Your audiobook is queued. You can cancel while waiting.", cancel_markup)
 
+        out_path = os.path.join(jdir, "part.mp3")
+
+        def save_checkpoint(note: str = "") -> None:
+            db.job_checkpoint(job_id, next_write, done_chunks, delivered, total_audio_ms // 1000,
+                              delivered_chars, note)
+
         async def upload_part():
-            nonlocal delivered, delivered_chars, total_audio_ms, part_ms, part_bytes, part_chars
+            nonlocal delivered, delivered_chars, total_audio_ms, part_ms, part_bytes, part_chars, part_index, part_start
             if not part_bytes:
                 return
             if job.cancel.is_set():
@@ -2566,28 +2969,42 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: str
             fixed_path = await remux_mp3(out_path)
             if os.path.getsize(fixed_path) > MAX_AUDIO_BYTES:
                 raise ValueError("Audio part exceeds the upload size limit")
-            number = delivered + 1
+            number = part_index + 1
             fname = f"{safe_filename(title)}_part{number:02d}.mp3"
             caption = (f"**{html.escape(title)[:80]}**\n"
                        f"{html.escape(part_label)[:60]} - part {number}\n"
                        f"{fmt_duration(part_ms / 1000)} | `{settings['voice']}`")
             await safe_edit(status, f"Uploading part {number} ({fmt_size(os.path.getsize(fixed_path))})...",
                             cancel_markup)
-            for attempt in range(3):
+            for attempt in range(5):
                 try:
                     await client.send_audio(status.chat.id, fixed_path, caption=caption,
                                             title=f"{title[:50]} - Part {number}", performer="AudioBook Pro",
                                             duration=max(1, math.ceil(part_ms / 1000)), file_name=fname)
                     break
                 except FloodWait as exc:
-                    if attempt == 2:
+                    if attempt == 4:
                         raise
                     await cancellable_sleep(float(exc.value) + 1, job.cancel)
+                except (RPCError, aiohttp.ClientError, OSError) as exc:
+                    if attempt == 4:
+                        raise
+                    log.warning("Upload of part %d failed (%s), retrying", number, exc)
+                    await cancellable_sleep(5 * (attempt + 1), job.cancel)
             delivered += 1
+            part_index += 1
             delivered_chars += part_chars
             total_audio_ms += part_ms  # Count delivered audio, not failed uploads.
             os.remove(fixed_path)
             part_ms = part_bytes = part_chars = 0
+            # Delivered chunks are no longer needed for resume; anything left on
+            # disk below ``next_write`` belongs to the *current* part.
+            for i in range(part_start, next_write):
+                for suffix in ("", ".ms"):
+                    with contextlib.suppress(OSError):
+                        os.remove(chunk_path(jdir, i) + suffix)
+            part_start = next_write
+            save_checkpoint()
 
         async with job_slots:
             if job.cancel.is_set():
@@ -2601,48 +3018,94 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: str
                 await safe_edit(status, "Checking TTS engines and planning audio...", cancel_markup)
                 remote = [u for u in servers if u != LOCAL_TTS_URL]
                 # Deep probe = real authenticated /tts call.  A server whose API key does not
-                # match (HTTP 401) or that cannot synthesise is dropped up front, instead of
-                # every chunk failing later with a vague "failed on all servers" message.
+                # match (HTTP 401) is dropped up front; a merely *busy/throttled* server is
+                # kept (it will recover) but starts in cooldown.
                 probes = await asyncio.gather(*(check_server(session, url, deep=True) for url in remote))
-                usable = []
-                skipped = []
+                usable: List[str] = []
+                skipped: List[str] = []
+                cooling: List[str] = []
                 for url, info in zip(remote, probes):
                     db.server_health(url, info["ok"])
+                    err = (info.get("error") or "").lower()
                     if info["ok"]:
                         usable.append(url)
-                    else:
+                    elif any(k in err for k in ("401", "404", "api key", "invalid url", "not mp3", "not an app.py")):
                         skipped.append(f"{url} ({info.get('error') or 'offline'})")
                         log.warning("Render server %s skipped for job %s: %s", url, job_id, info.get("error"))
+                    else:
+                        usable.append(url)
+                        cooling.append(url)
                 if LOCAL_TTS_ENABLED:
                     usable.append(LOCAL_TTS_URL)
                 if not usable:
                     raise ValueError("No working TTS engine. " + "; ".join(skipped)[:400])
                 pool = ServerPool(usable)
+                for s in pool.states:
+                    if s.url in cooling:
+                        s.cooldown_until = time.time() + 20
+                        s.last_error = "temporarily unavailable at job start"
                 if skipped:
-                    await safe_edit(status, "Skipping unusable engine(s):\n" +
+                    await safe_edit(status, "Skipping misconfigured engine(s):\n" +
                                     "\n".join(f"- {html.escape(s)[:160]}" for s in skipped[:5]) +
                                     "\n\nPlanning audio...", cancel_markup)
-                limits = [r["max_text_length"] for r in probes if r["ok"] and r.get("max_text_length")]
-                if LOCAL_TTS_ENABLED:
-                    limits.append(LOCAL_TTS_CHUNK_SIZE)
-                chunk_limit = min([CHUNK_SIZE] + limits)
-                chapters = split_chapters(text) if settings["split_mode"] == "chapter" else [("Audiobook", text)]
-                # Chunks are bounded by characters (server limits) AND by wire bytes so
-                # each one is exactly one Edge-TTS connection (see LOCAL_TTS_MAX_BYTES).
-                # Render servers run edge-tts too, so the same byte limit helps them.
-                plan = [(label, split_text_for_tts(body, chunk_limit, LOCAL_TTS_MAX_BYTES))
-                        for label, body in chapters]
-                total_chunks = sum(len(chunks) for _, chunks in plan)
-                # Sliding-window pipeline: as soon as one chunk finishes the next one is
-                # submitted, so a single slow request never idles the other slots (the
-                # old fixed batches waited for the slowest chunk of every batch).  The
-                # window bounds both in-flight requests and audio buffered in memory.
+
+                # ----------------------------------------------------------
+                # Plan (new job) - chunk list is persisted for resume
+                # ----------------------------------------------------------
+                if resume_job_id is None:
+                    limits = [r["max_text_length"] for r in probes if r["ok"] and r.get("max_text_length")]
+                    if LOCAL_TTS_ENABLED:
+                        limits.append(LOCAL_TTS_CHUNK_SIZE)
+                    chunk_limit = min([CHUNK_SIZE] + limits)
+                    src_path = os.path.join(jdir, "source.txt")
+
+                    def _plan() -> List[Tuple[str, str]]:
+                        with open(src_path, "r", encoding="utf-8") as f:
+                            full = f.read()
+                        if len(full) > MAX_EXTRACTED_CHARS:
+                            raise ValueError(f"Document exceeds the {MAX_EXTRACTED_CHARS:,} character limit")
+                        p = build_plan(full, chunk_limit, LOCAL_TTS_MAX_BYTES,
+                                       settings["split_mode"] == "chapter")
+                        write_plan(os.path.join(jdir, "plan.jsonl"), p)
+                        return p, len(full)
+
+                    plan, nchars = await asyncio.to_thread(_plan)
+                    db.execute("UPDATE jobs SET chars = ? WHERE id = ?", (nchars, job_id))
+                    db.job_init_resume(job_id, title, status.chat.id, status.id, settings, len(plan))
+                total_chunks = len(plan)
+                if not total_chunks:
+                    raise ValueError("No readable text found in the document")
+                max_part_ms = settings["max_hours"] * 3600 * 1000
+                keep_files = True  # from here on a crash must leave the checkpoint intact
+
+                # Rebuild the current (undelivered) part from checkpointed chunks on resume.
+                if resume_job_id is not None:
+                    if os.path.exists(out_path):
+                        os.remove(out_path)
+                    # Find where the last delivered part ended: everything before
+                    # next_write that is still on disk belongs to the current part.
+                    part_label = plan[min(next_write, total_chunks - 1)][0]
+                    part_start = next_write
+                    with open(out_path, "ab") as output:
+                        for i in range(next_write):
+                            if _chunk_ready(jdir, i):
+                                part_start = min(part_start, i)
+                                with open(chunk_path(jdir, i), "rb") as f:
+                                    data = f.read()
+                                output.write(data)
+                                part_bytes += len(data)
+                                part_ms += _read_meta(jdir, i)
+                                part_chars += len(plan[i][1])
+
                 parallel = pool.max_concurrency()
                 window = min(MAX_TOTAL_CONCURRENCY, parallel + PIPELINE_WINDOW_EXTRA)
                 sem = asyncio.Semaphore(parallel)
                 gen_started = time.monotonic()
+                gen_done_at_start = done_chunks
                 last_edit = 0.0
                 last_access_check = time.monotonic()
+                last_progress = time.monotonic()
+                stall_round = 0
 
                 async def report_progress(force: bool = False) -> None:
                     nonlocal last_edit
@@ -2652,90 +3115,212 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: str
                     last_edit = now
                     percent = int(done_chunks / total_chunks * 100) if total_chunks else 100
                     elapsed = now - gen_started
-                    eta = elapsed / done_chunks * (total_chunks - done_chunks) if done_chunks else 0.0
-                    rate = (f" | {local_limiter.current}x parallel" if LOCAL_TTS_ENABLED
-                            and any(s.is_local for s in pool.states) else "")
+                    fresh = done_chunks - gen_done_at_start
+                    eta = elapsed / fresh * (total_chunks - done_chunks) if fresh else 0.0
+                    engines = len(pool.states)
+                    par = pool.concurrency()
                     await safe_edit(status,
                                     f"**Generating audiobook**\n"
                                     f"[{progress_bar(percent)}] {percent}% ({done_chunks}/{total_chunks})\n"
-                                    f"Delivered: {delivered} parts | ETA {fmt_duration(eta)}{rate}",
+                                    f"Delivered: {delivered} parts | ETA {fmt_duration(eta)}\n"
+                                    f"{engines} engine(s) | {par}x parallel",
                                     cancel_markup)
 
                 await report_progress(force=True)
-                for label, chunks in plan:
-                    part_label = label
-                    pending: Dict[int, asyncio.Task] = {}
-                    next_submit = 0
-                    next_write = 0
-                    try:
-                        while next_write < len(chunks):
-                            if job.cancel.is_set():
-                                raise asyncio.CancelledError
-                            now = time.monotonic()
-                            if now - last_access_check >= 15:
-                                last_access_check = now
-                                if not db.is_approved(uid):
-                                    raise ValueError("Access expired or revoked during processing")
-                            # Keep the window full.
-                            while next_submit < len(chunks) and next_submit - next_write < window:
-                                pending[next_submit] = asyncio.create_task(
-                                    fetch_chunk(session, pool, chunks[next_submit], next_submit, settings, sem,
-                                                job.cancel))
-                                next_submit += 1
-                            # Consume strictly in order so the MP3 is written sequentially.
+                pending: Dict[int, asyncio.Task] = {}
+                next_submit = next_write
+                try:
+                    while next_write < total_chunks:
+                        if job.cancel.is_set():
+                            raise asyncio.CancelledError
+                        now = time.monotonic()
+                        if now - last_access_check >= 15:
+                            last_access_check = now
+                            if not db.is_approved(uid):
+                                raise ValueError("Access expired or revoked during processing")
+                        # Keep the window full (skip chunks already checkpointed).
+                        while next_submit < total_chunks and next_submit - next_write < window:
+                            idx = next_submit
+                            next_submit += 1
+                            if _chunk_ready(jdir, idx):
+                                continue
+                            pending[idx] = asyncio.create_task(
+                                fetch_chunk(session, pool, plan[idx][1], idx, settings, sem, job.cancel))
+                        # Consume strictly in order so the MP3 is written sequentially.
+                        if next_write in pending:
                             _, data, dur = await pending.pop(next_write)
-                            chunk_text = chunks[next_write]
-                            next_write += 1
                             if not data:
-                                # Do not silently splice later text over a missing passage.
-                                raise RuntimeError(f"Chunk {done_chunks + 1} failed on all attempted servers. "
-                                                   f"Reason: {pool.failure_summary()}")
-                            if part_bytes and (part_ms + dur > max_part_ms or
-                                               part_bytes + len(data) > MAX_AUDIO_BYTES - 1024 * 1024):
-                                await upload_part()
-                            if len(data) > MAX_AUDIO_BYTES or dur > max_part_ms:
-                                raise ValueError("A single audio chunk exceeds the part limit")
-                            with open(out_path, "ab") as output:
-                                output.write(data)
-                            part_bytes += len(data)
-                            part_ms += dur
-                            part_chars += len(chunk_text)
-                            done_chunks += 1
-                            await report_progress(force=done_chunks == total_chunks)
-                    finally:
-                        for task in pending.values():
-                            if not task.done():
-                                task.cancel()
-                        if pending:
-                            await asyncio.gather(*pending.values(), return_exceptions=True)
-                        pending.clear()
-                    if settings["split_mode"] == "chapter":
-                        await upload_part()
+                                # Every engine failed this round.  PAUSE, do not die.
+                                if JOB_MAX_STALL_MINUTES and (time.monotonic() - last_progress) > JOB_MAX_STALL_MINUTES * 60:
+                                    raise RuntimeError(
+                                        f"No engine produced audio for {JOB_MAX_STALL_MINUTES} minutes. "
+                                        f"Reason: {pool.failure_summary()}")
+                                # Drain the window so we do not hammer throttled engines while paused.
+                                for t in pending.values():
+                                    t.cancel()
+                                if pending:
+                                    await asyncio.gather(*pending.values(), return_exceptions=True)
+                                pending.clear()
+                                next_submit = next_write
+                                save_checkpoint(f"paused: {pool.failure_summary()[:150]}")
+                                await wait_for_engines(pool, session, job.cancel, status, cancel_markup,
+                                                       stall_round, done_chunks, total_chunks, job_id)
+                                stall_round += 1
+                                gen_started = time.monotonic()
+                                gen_done_at_start = done_chunks
+                                continue
+                            _write_chunk(jdir, next_write, data, dur)
+                        elif _chunk_ready(jdir, next_write):
+                            with open(chunk_path(jdir, next_write), "rb") as f:
+                                data = f.read()
+                            dur = _read_meta(jdir, next_write) or max(1, round(
+                                estimate_seconds(len(plan[next_write][1]), settings["rate"]) * 1000))
+                        else:
+                            # Should not happen; re-submit defensively.
+                            next_submit = next_write
+                            continue
+                        stall_round = 0
+                        last_progress = time.monotonic()
+                        label, chunk_text = plan[next_write]
+                        if label != part_label and part_bytes and settings["split_mode"] == "chapter":
+                            await upload_part()
+                        part_label = label
+                        if part_bytes and (part_ms + dur > max_part_ms or
+                                           part_bytes + len(data) > MAX_AUDIO_BYTES - 1024 * 1024):
+                            await upload_part()
+                        if len(data) > MAX_AUDIO_BYTES or dur > max_part_ms:
+                            raise ValueError("A single audio chunk exceeds the part limit")
+                        with open(out_path, "ab") as output:
+                            output.write(data)
+                        part_bytes += len(data)
+                        part_ms += dur
+                        part_chars += len(chunk_text)
+                        next_write += 1
+                        done_chunks = next_write
+                        if done_chunks % 10 == 0:
+                            save_checkpoint()
+                        await report_progress(force=done_chunks == total_chunks)
+                finally:
+                    for task in pending.values():
+                        if not task.done():
+                            task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending.values(), return_exceptions=True)
+                    pending.clear()
                 await upload_part()
         outcome = "done"
+        keep_files = False
         await safe_edit(status, f"**Audiobook complete!**\n{delivered} part(s) delivered | "
                                 f"{fmt_duration(total_audio_ms / 1000)} audio\n"
                                 f"Took {fmt_duration(time.monotonic() - started)}")
     except asyncio.CancelledError:
         outcome = "cancelled"
+        keep_files = False
         await safe_edit(status, f"Job cancelled. {delivered} complete part(s) were delivered.")
         raise
     except Exception as exc:
         outcome = "partial" if delivered else "failed"
         log.exception("Job %s failed", job_id)
+        hint = ""
+        if keep_files and job_id is not None:
+            outcome = "interrupted"
+            hint = "\n\nSend /resume to continue this job from where it stopped."
         await safe_edit(status, f"Processing stopped: {html.escape(str(exc))[:600]}\n\n"
-                                f"{delivered} complete part(s) delivered. No failed passages were silently skipped.\n"
-                                f"Tip: admins can run /servers to see each engine's status and error.")
+                                f"{delivered} complete part(s) delivered. No failed passages were silently skipped."
+                                f"{hint}\nTip: admins can run /servers to see each engine's status and error.")
     finally:
         if active_jobs.get(uid) is job:
             active_jobs.pop(uid, None)
-        if tmpdir:
-            shutil.rmtree(tmpdir, ignore_errors=True)
         if job_id is not None:
-            db.job_finish(job_id, outcome, delivered, total_audio_ms // 1000)
-            if delivered:
+            if keep_files:
+                db.job_checkpoint(job_id, next_write, done_chunks, delivered, total_audio_ms // 1000,
+                                  delivered_chars)
+                db.job_set_status(job_id, "interrupted")
+            else:
+                db.job_finish(job_id, outcome, delivered, total_audio_ms // 1000)
+                if jdir:
+                    shutil.rmtree(jdir, ignore_errors=True)
+            if delivered and outcome in ("done", "cancelled", "partial", "failed"):
                 db.record_usage(uid, delivered_chars, total_audio_ms // 1000)
         log.info("Job %s for %s -> %s (%d parts)", job_id, uid, outcome, delivered)
+
+
+async def resume_job(client: Client, row: sqlite3.Row, status: Optional[Message] = None) -> bool:
+    """Restart an interrupted/paused job for its owner. Returns True if started."""
+    uid = int(row["user_id"])
+    if uid in active_jobs:
+        return False
+    chat_id = int(row["chat_id"])
+    if status is None:
+        status = await safe_send(client, chat_id, f"♻️ Resuming your audiobook **{html.escape(row['title'] or '')[:60]}**…")
+        if status is None:
+            return False
+    job = reserve_job(uid)
+    if job is None:
+        return False
+    job.task = asyncio.create_task(run_audiobook_job(client, status, uid, source=row["source"] or "",
+                                                    title=row["title"] or "Audiobook", job=job,
+                                                    resume_job_id=int(row["id"])))
+    track_job(job)
+    return True
+
+
+async def resume_interrupted_jobs(client: Client) -> None:
+    """Called at startup: continue every job that a restart interrupted."""
+    if not RESUME_ON_START:
+        return
+    await asyncio.sleep(3)
+    rows = db.resumable_jobs()
+    for row in rows:
+        jdir = job_dir(int(row["id"]))
+        if not os.path.isfile(os.path.join(jdir, "plan.jsonl")):
+            db.job_set_status(int(row["id"]), "failed", "job files missing after restart")
+            shutil.rmtree(jdir, ignore_errors=True)
+            continue
+        try:
+            ok = await resume_job(client, row)
+            log.info("Auto-resume job %s -> %s", row["id"], "started" if ok else "skipped")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Auto-resume of job %s failed: %s", row["id"], exc)
+        await asyncio.sleep(1)
+
+
+@bot.on_message(filters.command("resume") & filters.private)
+async def cmd_resume(client: Client, message: Message):
+    uid = message.from_user.id
+    if not db.is_approved(uid):
+        await message.reply("🔒 You do not have access.")
+        return
+    if uid in active_jobs:
+        await message.reply("⏳ A job is already running.")
+        return
+    row = db.user_resumable_job(uid)
+    if row is None:
+        await message.reply("Nothing to resume - you have no interrupted audiobook.")
+        return
+    status = await message.reply("♻️ Resuming…")
+    if not await resume_job(client, row, status):
+        await safe_edit(status, "Could not resume right now, please try again.")
+
+
+@bot.on_message(filters.command("jobs") & filters.private)
+async def cmd_jobs(client: Client, message: Message):
+    if not _is_admin_msg(message):
+        return
+    rows = db.fetchall("SELECT * FROM jobs WHERE status IN ('running','paused','interrupted') ORDER BY id DESC LIMIT 20")
+    if not rows:
+        await message.reply("No running, paused or interrupted jobs.")
+        return
+    lines = ["**Jobs**"]
+    for r in rows:
+        total = r["total_chunks"] or 0
+        done = r["done_chunks"] or 0
+        pct = int(done / total * 100) if total else 0
+        icon = {"running": "▶️", "paused": "⏸", "interrupted": "⚠️"}.get(r["status"], "•")
+        lines.append(f"{icon} #{r['id']} user `{r['user_id']}` — {html.escape((r['title'] or r['source'] or '')[:30])} "
+                     f"— {pct}% ({done}/{total}) — {r['parts'] or 0} parts"
+                     + (f"\n   ↳ {html.escape((r['stall_note'] or '')[:120])}" if r["stall_note"] else ""))
+    await message.reply("\n".join(lines))
 
 
 # =============================================================================
@@ -2766,6 +3351,7 @@ async def main() -> None:
     if not BOT_TOKEN or not API_HASH or API_ID <= 0 or OWNER_ID <= 0:
         raise SystemExit("Set API_ID, API_HASH, BOT_TOKEN and OWNER_ID environment variables before starting.")
     pinger = None
+    resumer = None
     started = False
     try:
         await bot.start()
@@ -2782,6 +3368,7 @@ async def main() -> None:
             log.warning("edge-tts is not installed - the built-in fallback engine is unavailable "
                         "(pip install edge-tts).")
         pinger = asyncio.create_task(keep_alive_loop())
+        resumer = asyncio.create_task(resume_interrupted_jobs(bot))
         engine = (f"built-in Edge-TTS (free, {LOCAL_TTS_CONCURRENCY}-{LOCAL_TTS_MAX_CONCURRENCY}x parallel)"
                   if LOCAL_TTS_ENABLED else "render servers only")
         await safe_send(bot, OWNER_ID, f"AudioBook Pro v{VERSION} is online.\nEngine: {engine}\n"
@@ -2793,6 +3380,8 @@ async def main() -> None:
         tasks.extend(list(preview_tasks.values()))
         if pinger is not None:
             tasks.append(pinger)
+        if resumer is not None:
+            tasks.append(resumer)
         for task in tasks:
             task.cancel()
         if tasks:

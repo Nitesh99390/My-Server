@@ -33,6 +33,9 @@
                       (or ?api_key=<key>)
    MAX_TEXT_LENGTH    default 6000 characters per request
    MAX_CONCURRENCY    default 4 simultaneous synth jobs (max 8; higher gets the IP throttled)
+   ATTEMPT_TIMEOUT    default 75 s per Edge-TTS connection attempt
+   QUEUE_TIMEOUT      default 45 s waiting for a free slot before 503 + Retry-After
+   MAX_QUEUE          default 16 requests waiting for a slot (more -> instant 503)
    MIN_START_GAP_MS   default 200 ms between new Edge-TTS connections (burst protection)
    DEFAULT_VOICE      default hi-IN-MadhurNeural
    TTS_RETRIES        default 3
@@ -78,7 +81,7 @@ except Exception:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-VERSION = "3.2.0"
+VERSION = "4.0.0"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -105,7 +108,16 @@ RATE_LIMIT = _env_int("RATE_LIMIT", 120)
 CACHE_MAX_BYTES = _env_int("CACHE_MAX_MB", 64) * 1024 * 1024
 ENABLE_CORS = _env_bool("ENABLE_CORS", True)
 VOICE_CACHE_TTL = 6 * 3600  # seconds
-SYNTH_TIMEOUT = max(5, _env_int("SYNTH_TIMEOUT", 180))  # whole request, including queue time
+SYNTH_TIMEOUT = max(5, _env_int("SYNTH_TIMEOUT", 240))  # whole request, including queue time
+# Per-attempt budget for one Edge-TTS connection.  Previously this was
+# SYNTH_TIMEOUT / TTS_RETRIES *including* queue wait, so under load every attempt
+# timed out and the client saw "502 NoAudioReceived" even though the IP was fine.
+ATTEMPT_TIMEOUT = max(10, _env_int("ATTEMPT_TIMEOUT", 75))
+# How long a request may wait for a free synthesis slot before we answer
+# 503 + Retry-After (so the bot immediately moves to another server).
+QUEUE_TIMEOUT = max(1, _env_int("QUEUE_TIMEOUT", 45))
+# Requests waiting for a slot beyond this number are rejected instantly with 503.
+MAX_QUEUE = max(0, _env_int("MAX_QUEUE", 16))
 TRUST_PROXY_HOPS = max(0, _env_int("TRUST_PROXY_HOPS", 0))
 
 logging.basicConfig(
@@ -150,6 +162,8 @@ class AsyncRunner:
         self.last_start = 0.0
         self.cooldown_until = 0.0
         self.throttle_events = 0
+        self.waiting = 0
+        self.last_throttle_at = 0.0
 
     def _run(self) -> None:
         asyncio.set_event_loop(self.loop)
@@ -174,6 +188,7 @@ class AsyncRunner:
 
     def note_throttle(self) -> float:
         self.throttle_events += 1
+        self.last_throttle_at = time.monotonic()
         pause = min(20.0, 1.5 * self.throttle_events)
         self.cooldown_until = max(self.cooldown_until, time.monotonic() + pause)
         return pause
@@ -181,6 +196,12 @@ class AsyncRunner:
     def note_success(self) -> None:
         if self.throttle_events and time.monotonic() > self.cooldown_until + 60:
             self.throttle_events = 0
+
+    @property
+    def throttled(self) -> bool:
+        """True while Microsoft recently pushed back on this IP."""
+        return time.monotonic() < self.cooldown_until or (
+            self.throttle_events >= 3 and time.monotonic() - self.last_throttle_at < 120)
 
     def run(self, coro, timeout: float = SYNTH_TIMEOUT):
         fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
@@ -220,6 +241,22 @@ class LazyRunner:
     @property
     def active(self):
         return self._instance.active if self._instance is not None else 0
+
+    @property
+    def waiting(self):
+        return self._instance.waiting if self._instance is not None else 0
+
+    @waiting.setter
+    def waiting(self, value):
+        self._get().waiting = value
+
+    @property
+    def throttled(self):
+        return self._instance.throttled if self._instance is not None else False
+
+    @property
+    def throttle_events(self):
+        return self._instance.throttle_events if self._instance is not None else 0
 
 
 runner = LazyRunner()
@@ -415,29 +452,72 @@ def _looks_throttled(exc: BaseException) -> bool:
                                       "NoAudioReceived", "ServerDisconnectedError", "ClientConnectorError"})
 
 
+class ServiceBusy(RuntimeError):
+    """Raised when no synthesis slot became free in time (client should retry elsewhere)."""
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__(f"Server busy: all {MAX_CONCURRENCY} synthesis slots in use")
+        self.retry_after = retry_after
+
+
+class Throttled(RuntimeError):
+    """Raised when Microsoft's endpoint keeps refusing this IP (client should back off)."""
+
+    def __init__(self, retry_after: int, detail: str) -> None:
+        super().__init__(detail)
+        self.retry_after = retry_after
+
+
 async def synthesize(text: str, voice: str, rate: str, pitch: str, volume: str,
                      collect_words: bool = False):
-    """Synthesize with retry + concurrency limiting + start pacing (throttle safe)."""
+    """Synthesize with retry + concurrency limiting + start pacing (throttle safe).
+
+    The slot is held only for the duration of ONE Edge-TTS connection: waiting
+    for a slot, back-off between attempts and the retries themselves all happen
+    *outside* the semaphore, so a struggling request never starves the others.
+    """
     last_err: Optional[Exception] = None
-    async with runner.semaphore:
-        for attempt in range(1, TTS_RETRIES + 1):
-            await runner.pace()
+    deadline = time.monotonic() + SYNTH_TIMEOUT - 2
+    for attempt in range(1, TTS_RETRIES + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 1:
+            break
+        # Reject instantly only when every slot is busy *and* the queue is full.
+        # (With MAX_QUEUE=0 a free slot must still be usable.)
+        if runner.semaphore.locked() and runner.waiting >= MAX_QUEUE:
+            raise ServiceBusy(retry_after=5)
+        runner.waiting += 1
+        try:
             try:
-                result = await asyncio.wait_for(
-                    _synthesize_once(text, voice, rate, pitch, volume, collect_words),
-                    timeout=max(1, (SYNTH_TIMEOUT - 3) / TTS_RETRIES),
-                )
-                runner.note_success()
-                return result
-            except Exception as exc:  # noqa: BLE001
-                last_err = exc
-                pause = runner.note_throttle() if _looks_throttled(exc) else 0.0
-                log.warning("Synthesis attempt %d/%d failed (%s): %s",
-                            attempt, TTS_RETRIES, type(exc).__name__, exc)
-                if attempt < TTS_RETRIES:
-                    # exponential back-off with jitter; longer when throttled
-                    await asyncio.sleep(min(30.0, (1.5 ** attempt) + pause + random.uniform(0.1, 0.8)))
-    raise RuntimeError(f"TTS failed after {TTS_RETRIES} attempts: {type(last_err).__name__}: {last_err}")
+                await asyncio.wait_for(runner.semaphore.acquire(), timeout=min(QUEUE_TIMEOUT, remaining))
+            except asyncio.TimeoutError:
+                raise ServiceBusy(retry_after=int(QUEUE_TIMEOUT / 2) or 5)
+        finally:
+            runner.waiting -= 1
+        try:
+            await runner.pace()
+            result = await asyncio.wait_for(
+                _synthesize_once(text, voice, rate, pitch, volume, collect_words),
+                timeout=max(5, min(ATTEMPT_TIMEOUT, deadline - time.monotonic())),
+            )
+            runner.note_success()
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            pause = runner.note_throttle() if _looks_throttled(exc) else 0.0
+            log.warning("Synthesis attempt %d/%d failed (%s): %s",
+                        attempt, TTS_RETRIES, type(exc).__name__, exc)
+        finally:
+            runner.semaphore.release()
+        if attempt < TTS_RETRIES:
+            # exponential back-off with jitter; longer when throttled
+            await asyncio.sleep(min(30.0, (1.5 ** attempt) + pause + random.uniform(0.1, 0.8)))
+    detail = f"TTS failed after {TTS_RETRIES} attempts: {type(last_err).__name__}: {last_err}"
+    if last_err is not None and _looks_throttled(last_err):
+        raise Throttled(retry_after=int(min(60, 10 * max(1, runner.throttle_events))), detail=detail)
+    raise RuntimeError(detail)
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +748,9 @@ def health():
         max_text_length=MAX_TEXT_LENGTH,
         max_concurrency=MAX_CONCURRENCY,
         active_jobs=runner.active,
+        queued=getattr(runner, "waiting", 0),
+        throttled=bool(getattr(runner, "throttled", False)),
+        throttle_events=getattr(runner, "throttle_events", 0),
         auth_required=bool(API_KEY),
         default_voice=DEFAULT_VOICE,
         rate_limit_per_minute=RATE_LIMIT,
@@ -735,10 +818,21 @@ def tts():
     else:
         hit = False
         try:
-            audio, duration_ms, _ = runner.run(synthesize(**params), timeout=SYNTH_TIMEOUT)
+            audio, duration_ms, _ = runner.run(synthesize(**params), timeout=SYNTH_TIMEOUT + 5)
         except FutureTimeoutError:
             stats.record(False, error="Synthesis timed out")
             return _error("Synthesis timed out; please retry", 504)
+        except ServiceBusy as exc:
+            stats.reject()
+            resp = _error(str(exc), 503)
+            resp[0].headers["Retry-After"] = str(exc.retry_after)
+            return resp
+        except Throttled as exc:
+            log.error("[%s] TTS throttled: %s", g.request_id, exc)
+            stats.record(False, error=str(exc))
+            resp = _error(str(exc), 503)
+            resp[0].headers["Retry-After"] = str(exc.retry_after)
+            return resp
         except RuntimeError as exc:
             log.error("[%s] TTS error: %s", g.request_id, exc)
             stats.record(False, error=str(exc))
@@ -897,10 +991,15 @@ def tts_subtitles():
 
     started = time.time()
     try:
-        audio, duration_ms, words = runner.run(synthesize(**params, collect_words=True), timeout=SYNTH_TIMEOUT)
+        audio, duration_ms, words = runner.run(synthesize(**params, collect_words=True), timeout=SYNTH_TIMEOUT + 5)
     except FutureTimeoutError:
         stats.record(False, error="Synthesis timed out")
         return _error("Synthesis timed out; please retry", 504)
+    except (ServiceBusy, Throttled) as exc:
+        stats.record(False, error=str(exc))
+        resp = _error(str(exc), 503)
+        resp[0].headers["Retry-After"] = str(exc.retry_after)
+        return resp
     except RuntimeError as exc:
         stats.record(False, error=str(exc))
         return _error(str(exc), 502)

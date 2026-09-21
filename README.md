@@ -9,7 +9,24 @@ neural voices** (`edge-tts`) — no API key, no paid TTS service.
 | `bot.py` | Telegram bot (Pyrogram/MTProto, uploads up to 2 GB). **Built-in free Edge-TTS engine**, chunking, chapter splitting, optional multi-server load balancing, progress bar, user approval system, admin panel. |
 | `app.py` | *Optional* Flask micro-service wrapping `edge-tts` for extra render capacity on other IPs. `/tts`, `/tts/stream`, `/tts/subtitles`, `/voices`, `/health`, `/stats`. |
 
-Version: **3.3.0**
+Version: **4.0.0**
+
+---
+
+## ⭐ v4: any file size, any number of servers, never gives up
+
+| Problem in v3 | v4 behaviour |
+|---------------|--------------|
+| One chunk failing on every engine → whole job dies with *"0 complete part(s) delivered"* | Job **pauses** (5 s → 10 s → … → 5 min back-off), re-probes the engines and continues from the exact chunk. Only `/cancel` (or `JOB_MAX_STALL_MINUTES`) stops it. |
+| Bot restart / Render sleep → job lost | Every chunk is **checkpointed** to `JOBS_DIR/<job>/chunks/`, the cursor is stored in SQLite. Jobs auto-resume on start (`RESUME_ON_START`) or with `/resume`. Delivered parts are never re-sent. |
+| `MAX_EXTRACTED_CHARS=2,000,000` rejected big Hindi EPUBs | Streaming extractor (EPUB spine item-by-item, PDF page-by-page) writes straight to disk; default cap 50 M chars, files up to `MAX_FILE_MB=200`. |
+| Render server: retry budget shared with queue wait → `502 NoAudioReceived` under load while `/servers` showed 4/4 green | `app.py` holds a slot for **one** connection only; waiting for a slot returns `503 + Retry-After` so the bot instantly fails over. `/health` exposes `throttled`, `queued`. |
+| Only the built-in engine had an adaptive limiter; remote servers used a fixed semaphore | **One adaptive limiter per server** (starts at `PER_SERVER_CONCURRENCY`, grows to 2× while healthy, halves on 429/502/503/timeout). Throughput scales linearly with servers; `MAX_TOTAL_CONCURRENCY=64` is the only global cap. |
+| `/servers` probe said "OK" with a 2-letter text | Probe is a real ~120-char Hindi synthesis on every engine and shows each server's live limit / throttle count. |
+
+New commands: `/resume` (user) · `/jobs` (admin: running / paused / interrupted jobs with progress and last stall reason).
+
+> Put `JOBS_DIR` (and `DB_PATH`) on a persistent disk when hosting on Render so resume survives redeploys.
 
 ---
 
