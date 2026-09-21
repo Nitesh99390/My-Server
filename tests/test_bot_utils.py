@@ -1,4 +1,7 @@
 """Offline unit tests for bot.py helpers (no Telegram / network needed)."""
+import asyncio
+import math
+import time
 import os
 import sys
 import importlib
@@ -85,9 +88,10 @@ def test_is_throttle_error_classification():
 def test_adaptive_limiter_shrinks_and_grows():
     lim = bot.AdaptiveLimiter(start=4, maximum=6, min_gap=0)
     assert lim.current == 4
-    pause = lim.report_throttle()
+    # Hard throttle (403/429) halves the capacity.
+    pause = lim.report_throttle(hard=True)
     assert lim.current == 2 and pause > 0
-    lim.report_throttle()
+    lim.report_throttle(hard=True)
     assert lim.current == 1
     for _ in range(lim.grow_after):
         lim.report_success()
@@ -95,6 +99,35 @@ def test_adaptive_limiter_shrinks_and_grows():
     for _ in range(lim.grow_after * 10):
         lim.report_success()
     assert lim.current == 6  # never above maximum
+
+
+def test_adaptive_limiter_soft_throttle_steps_down_by_one():
+    lim = bot.AdaptiveLimiter(start=6, maximum=8, min_gap=0)
+    pause = lim.report_throttle()  # soft: dropped socket / timeout
+    assert lim.current == 5 and 0 < pause <= 7
+    lim.report_throttle()
+    assert lim.current == 4
+    # Soft cool-downs are much shorter than hard ones.
+    hard = bot.AdaptiveLimiter(start=6, maximum=8, min_gap=0)
+    assert hard.report_throttle(hard=True) > pause
+
+
+def test_adaptive_limiter_warm_start_targets_utilisation():
+    lim = bot.AdaptiveLimiter(start=2, maximum=8, min_gap=0)
+    lim.warm_start(0.9)
+    assert lim.current == 8  # ceil(8 * 0.9) = 8
+    lim = bot.AdaptiveLimiter(start=2, maximum=6, min_gap=0)
+    lim.warm_start(0.75)
+    assert lim.current == 5
+    # After a throttle event we do not jump back up blindly.
+    lim.report_throttle(hard=True)
+    before = lim.current
+    lim.warm_start(0.9)
+    assert lim.current == before
+    # Utilisation never exceeds the ceiling or drops below the current value.
+    lim = bot.AdaptiveLimiter(start=5, maximum=6, min_gap=0)
+    lim.warm_start(0.3)
+    assert lim.current == 5
 
 
 def test_adaptive_limiter_enforces_concurrency():
@@ -233,8 +266,38 @@ def test_adaptive_limiter_grows_and_shrinks():
     for _ in range(lim.grow_after):
         lim.report_success()
     assert lim.current == 3
-    pause = lim.report_throttle()
+    pause = lim.report_throttle(hard=True)
     assert lim.current == 1 and pause > 0
+
+
+def test_hard_vs_soft_throttle_classification():
+    assert bot._is_hard_throttle(RuntimeError("HTTP 403 forbidden"))
+    assert bot._is_hard_throttle(RuntimeError("429 too many requests"))
+    assert not bot._is_hard_throttle(asyncio.TimeoutError())
+    assert bot._is_throttle_error(asyncio.TimeoutError())
+
+    class NoAudioReceived(Exception):
+        pass
+
+    assert bot._is_throttle_error(NoAudioReceived("empty"))
+    assert not bot._is_hard_throttle(NoAudioReceived("empty"))
+    assert not bot._is_throttle_error(ValueError("bad input"))
+
+
+def test_pool_warm_start_and_short_cooldown():
+    pool = bot.ServerPool(["https://a.example", "https://b.example"])
+    for s in pool.states:
+        lim = s.limiter
+        lim.current = 1
+        lim.throttle_events = 0
+    pool.warm_start()
+    for s in pool.states:
+        assert s.limiter.current == max(1, math.ceil(s.limiter.maximum * bot.TARGET_UTILISATION))
+    # Two consecutive failures put the engine in a *short* cooldown (seconds, not minutes).
+    s = pool.states[0]
+    pool.report(s, False, error="x")
+    pool.report(s, False, error="y")
+    assert 0 < s.cooldown_until - time.time() <= 10
 
 
 def test_extract_text_to_file_txt_upload_like_document_job(tmp_path):

@@ -9,7 +9,23 @@ neural voices** (`edge-tts`) — no API key, no paid TTS service.
 | `bot.py` | Telegram bot (Pyrogram/MTProto, uploads up to 2 GB). **Built-in free Edge-TTS engine**, chunking, chapter splitting, optional multi-server load balancing, progress bar, user approval system, admin panel. |
 | `app.py` | *Optional* Flask micro-service wrapping `edge-tts` for extra render capacity on other IPs. `/tts`, `/tts/stream`, `/tts/subtitles`, `/voices`, `/health`, `/stats`. |
 
-Version: **bot 4.2.0 / server 4.0.0**
+Version: **bot 4.3.0 / server 4.1.0**
+
+---
+
+## 🚀 v4.3: run every engine at 90 % of its ceiling from chunk 1
+
+| Problem in v4.2 | v4.3 behaviour |
+|-----------------|----------------|
+| Engines started at 4 streams and grew **+1 per 8 clean chunks** - a 1 000-chunk job spent minutes ramping up; 4 engines showed *3/4 in flight* | **Warm start**: at job start (and after every pause) every healthy engine jumps to `TARGET_UTILISATION_PCT=90` of its ceiling. Defaults raised: built-in 6→8 streams, render servers 6→8 (`MAX_CONCURRENCY=6` on `app.py`). Growth every 3 clean chunks (2 for servers). |
+| **Any** failure (timeout, dropped socket, empty audio) was treated as Microsoft throttling: capacity **halved**, 2-30 s cool-down | Failures are classified: **hard** (HTTP 403/429 / handshake refused) still halves; **soft** (timeout, `NoAudioReceived`, dropped socket) only steps down by one with a ≤6 s cool-down and retries almost immediately. |
+| Two flaky chunks put a healthy server in a 20-180 s cooldown | Per-server cooldown `3 s × streak`, capped at 60 s. |
+| `LOCAL_TTS_MIN_GAP_MS=150` / `MIN_START_GAP_MS=200` serialised connection starts | 40 ms / 50 ms - bursts are still prevented, slots fill in a fraction of the time. |
+| Chunk checkpoint + MP3 append ran on the event loop | Disk I/O runs in a worker thread; the scheduler keeps feeding engines. |
+| `app.py` queued requests for 45 s before 503 | `QUEUE_TIMEOUT=12`, `MAX_QUEUE=8`, `gunicorn --threads 16`: a full server hands the chunk back to the bot fast so it lands on a free engine. |
+| Progress line showed chunk counts only | Professional dashboard: `%`, chunks & chars, audio ready, ETA + elapsed, `chars/s` · `× realtime`, in-flight / capacity %, **per-engine `active/limit`** with ●/⏸ state and throttle count. |
+
+Typical effect with 4 engines: 3-4 requests in flight → **24-30**, ~285 chars/s → **1 200-1 800 chars/s** (5-6×), while the adaptive limiters still step down the moment Microsoft pushes back - jobs never fail, they pause and continue.
 
 ---
 
@@ -51,14 +67,15 @@ Microsoft's free endpoint throttles an IP that opens too many streams at once
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `LOCAL_TTS_ENABLED` | `true` | Synthesise directly inside the bot (no render server needed). |
-| `LOCAL_TTS_CONCURRENCY` | `4` | Parallel Edge-TTS streams to start with. |
-| `LOCAL_TTS_MAX_CONCURRENCY` | `6` | Ceiling. Grows +1 after `LOCAL_TTS_GROW_AFTER` clean chunks, halves on any throttle signal. |
+| `LOCAL_TTS_CONCURRENCY` | `6` | Parallel Edge-TTS streams to start with (warm-started to `TARGET_UTILISATION_PCT` of the ceiling at job start). |
+| `LOCAL_TTS_MAX_CONCURRENCY` | `8` | Ceiling. Grows +1 after `LOCAL_TTS_GROW_AFTER` clean chunks; -1 on a soft failure, halves on a hard 403/429. |
+| `TARGET_UTILISATION_PCT` | `90` | Every engine is warmed straight to this % of its ceiling from chunk 1. |
 | `LOCAL_TTS_CHUNK_SIZE` | `3000` | Characters per request. |
 | `LOCAL_TTS_MAX_BYTES` | `3900` | Wire bytes per request. Edge accepts ~4096 bytes per websocket message; Hindi is 3 bytes/char, so chunks are sized by bytes so that **one chunk = one connection** (otherwise edge-tts splits it into several *sequential* connections). |
 | `LOCAL_TTS_RETRIES` | `4` | Attempts per chunk, exponential back-off + jitter. |
-| `LOCAL_TTS_MIN_GAP_MS` | `150` | Minimum spacing between new connections (no bursts). |
-| `LOCAL_TTS_GROW_AFTER` | `8` | Consecutive clean chunks before adding one more stream. |
-| `PROGRESS_EDIT_INTERVAL` | `4` | Seconds between Telegram progress edits (avoids FloodWait stalls). |
+| `LOCAL_TTS_MIN_GAP_MS` | `40` | Minimum spacing between new connections (no bursts). |
+| `LOCAL_TTS_GROW_AFTER` | `3` | Consecutive clean chunks before adding one more stream. |
+| `PROGRESS_EDIT_INTERVAL` | `5` | Seconds between Telegram progress edits (avoids FloodWait stalls). |
 
 Chunks flow through a **sliding-window pipeline**: the moment one chunk finishes
 the next is submitted, so a single slow request never idles the other slots (older
@@ -78,7 +95,7 @@ fallback.
 Deploy one or more copies (Render free tier works). The bot load-balances across all of them.
 
 **Render:** push this repo → *New Web Service* → Build `pip install -r requirements-server.txt`
-→ Start `gunicorn app:app --workers 1 --threads 8 --timeout 300`.
+→ Start `gunicorn app:app --workers 1 --threads 16 --timeout 300`.
 Or use the included `render.yaml` blueprint.
 
 **Docker:**
@@ -87,8 +104,8 @@ docker build -f Dockerfile.server -t tts-server .
 docker run -p 10000:10000 -e API_KEY=mysecret tts-server
 ```
 
-Key env vars: `PORT`, `API_KEY`, `MAX_TEXT_LENGTH=6000`, `MAX_CONCURRENCY=4` (keep ≤ 6 per IP),
-`MIN_START_GAP_MS=200`, `RATE_LIMIT=120`, `CACHE_MAX_MB=64`, `TRUST_PROXY_HOPS=1` (behind Render/Cloudflare).
+Key env vars: `PORT`, `API_KEY`, `MAX_TEXT_LENGTH=6000`, `MAX_CONCURRENCY=6` (max 8 per IP),
+`MIN_START_GAP_MS=50`, `QUEUE_TIMEOUT=12`, `RATE_LIMIT=240`, `CACHE_MAX_MB=64`, `TRUST_PROXY_HOPS=1` (behind Render/Cloudflare).
 
 Quick test:
 ```bash
