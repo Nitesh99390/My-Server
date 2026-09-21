@@ -9,7 +9,7 @@ neural voices** (`edge-tts`) — no API key, no paid TTS service.
 | `bot.py` | Telegram bot (Pyrogram/MTProto, uploads up to 2 GB). **Built-in free Edge-TTS engine**, chunking, chapter splitting, optional multi-server load balancing, progress bar, user approval system, admin panel. |
 | `app.py` | *Optional* Flask micro-service wrapping `edge-tts` for extra render capacity on other IPs. `/tts`, `/tts/stream`, `/tts/subtitles`, `/voices`, `/health`, `/stats`. |
 
-Version: **3.2.0**
+Version: **3.3.0**
 
 ---
 
@@ -21,15 +21,23 @@ Microsoft's free endpoint throttles an IP that opens too many streams at once
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `LOCAL_TTS_ENABLED` | `true` | Synthesise directly inside the bot (no render server needed). |
-| `LOCAL_TTS_CONCURRENCY` | `3` | Parallel Edge-TTS streams to start with. |
-| `LOCAL_TTS_MAX_CONCURRENCY` | `5` | Ceiling. Grows +1 after 12 clean chunks, halves on any throttle signal. |
-| `LOCAL_TTS_CHUNK_SIZE` | `2500` | Characters per request. |
+| `LOCAL_TTS_CONCURRENCY` | `4` | Parallel Edge-TTS streams to start with. |
+| `LOCAL_TTS_MAX_CONCURRENCY` | `6` | Ceiling. Grows +1 after `LOCAL_TTS_GROW_AFTER` clean chunks, halves on any throttle signal. |
+| `LOCAL_TTS_CHUNK_SIZE` | `3000` | Characters per request. |
+| `LOCAL_TTS_MAX_BYTES` | `3900` | Wire bytes per request. Edge accepts ~4096 bytes per websocket message; Hindi is 3 bytes/char, so chunks are sized by bytes so that **one chunk = one connection** (otherwise edge-tts splits it into several *sequential* connections). |
 | `LOCAL_TTS_RETRIES` | `4` | Attempts per chunk, exponential back-off + jitter. |
-| `LOCAL_TTS_MIN_GAP_MS` | `250` | Minimum spacing between new connections (no bursts). |
+| `LOCAL_TTS_MIN_GAP_MS` | `150` | Minimum spacing between new connections (no bursts). |
+| `LOCAL_TTS_GROW_AFTER` | `8` | Consecutive clean chunks before adding one more stream. |
+| `PROGRESS_EDIT_INTERVAL` | `4` | Seconds between Telegram progress edits (avoids FloodWait stalls). |
 
-Result: ~3–5× faster than sequential generation while automatically backing off
-before Microsoft blocks the IP. Works on Render even though the outbound IP changes —
-the limiter is per-process, so a new IP simply starts fresh.
+Chunks flow through a **sliding-window pipeline**: the moment one chunk finishes
+the next is submitted, so a single slow request never idles the other slots (older
+versions waited for the slowest chunk of every fixed batch of 8). Measured on a
+Render-class IP: ~25× realtime for Hindi with zero 403s, and the limiter still halves
+itself immediately if Microsoft ever pushes back.
+
+Works on Render even though the outbound IP changes — the limiter is per-process,
+so a new IP simply starts fresh.
 
 If you also add external render servers (`app.py`), they are used **first** (more
 IPs = more total throughput) and the built-in engine acts as an always-available

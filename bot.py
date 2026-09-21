@@ -35,11 +35,14 @@
 
    Built-in FREE Edge-TTS engine (no API key, no render server needed)
    LOCAL_TTS_ENABLED          default true  - synthesise directly inside the bot
-   LOCAL_TTS_CONCURRENCY      default 3     - parallel Edge-TTS streams to start with
-   LOCAL_TTS_MAX_CONCURRENCY  default 5     - hard ceiling (auto-scales up while healthy)
-   LOCAL_TTS_CHUNK_SIZE       default 2500  - characters per Edge-TTS request
+   LOCAL_TTS_CONCURRENCY      default 4     - parallel Edge-TTS streams to start with
+   LOCAL_TTS_MAX_CONCURRENCY  default 6     - hard ceiling (auto-scales up while healthy)
+   LOCAL_TTS_CHUNK_SIZE       default 3000  - characters per Edge-TTS request
+   LOCAL_TTS_MAX_BYTES        default 3900  - wire bytes per request (1 chunk = 1 connection)
    LOCAL_TTS_RETRIES          default 4     - attempts per chunk before failing over
-   LOCAL_TTS_MIN_GAP_MS       default 250   - spacing between new connections (anti-throttle)
+   LOCAL_TTS_MIN_GAP_MS       default 150   - spacing between new connections (anti-throttle)
+   LOCAL_TTS_GROW_AFTER       default 8     - clean chunks before adding one more stream
+   PROGRESS_EDIT_INTERVAL     default 4     - seconds between progress-message edits
 
  Requirements
  ------------
@@ -122,7 +125,7 @@ except ImportError:  # pragma: no cover
 # =============================================================================
 # Configuration
 # =============================================================================
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -167,15 +170,35 @@ MAX_QUEUED_JOBS = max(MAX_PARALLEL_JOBS, _env_int("MAX_QUEUED_JOBS", 20))
 # noticeably faster than sequential generation while staying under that limit;
 # the engine scales itself down automatically when it sees throttling and
 # creeps back up once things are healthy again.
+#
+# Speed notes (why the defaults look the way they do):
+#   * Edge accepts at most ~4096 bytes of (XML-escaped, UTF-8) text per websocket
+#     message.  Hindi/Devanagari is 3 bytes per character, so a 2500-character
+#     chunk used to be sent as TWO sequential connections inside one slot.
+#     Chunks are therefore sized by *bytes* (LOCAL_TTS_MAX_BYTES) so every chunk
+#     is exactly one connection and all of them can run in parallel.
+#   * Chunks are fed through a sliding window instead of fixed batches, so a slow
+#     chunk never leaves the other slots idle.
+#   * 6 concurrent streams per IP is the highest level that stays reliably free
+#     of HTTP 403 in practice; the limiter still halves itself on any throttle.
 LOCAL_TTS_URL = "local://edge-tts"
 LOCAL_TTS_ENABLED = (os.getenv("LOCAL_TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
                      and edge_tts is not None)
-LOCAL_TTS_MAX_CONCURRENCY = max(1, min(_env_int("LOCAL_TTS_MAX_CONCURRENCY", 5), 8))
-LOCAL_TTS_CONCURRENCY = max(1, min(_env_int("LOCAL_TTS_CONCURRENCY", 3), LOCAL_TTS_MAX_CONCURRENCY))
-LOCAL_TTS_CHUNK_SIZE = max(500, min(_env_int("LOCAL_TTS_CHUNK_SIZE", 2500), 5000))
+LOCAL_TTS_MAX_CONCURRENCY = max(1, min(_env_int("LOCAL_TTS_MAX_CONCURRENCY", 6), 8))
+LOCAL_TTS_CONCURRENCY = max(1, min(_env_int("LOCAL_TTS_CONCURRENCY", 4), LOCAL_TTS_MAX_CONCURRENCY))
+LOCAL_TTS_CHUNK_SIZE = max(500, min(_env_int("LOCAL_TTS_CHUNK_SIZE", 3000), 5000))
+# Edge's hard limit is 4096 bytes per message (after XML escaping); keep a margin.
+LOCAL_TTS_MAX_BYTES = max(1000, min(_env_int("LOCAL_TTS_MAX_BYTES", 3900), 4000))
 LOCAL_TTS_RETRIES = max(1, min(_env_int("LOCAL_TTS_RETRIES", 4), 8))
-LOCAL_TTS_MIN_GAP = max(0, _env_int("LOCAL_TTS_MIN_GAP_MS", 250)) / 1000.0
-LOCAL_TTS_TIMEOUT = max(20, _env_int("LOCAL_TTS_TIMEOUT", 120))  # seconds per chunk attempt
+LOCAL_TTS_MIN_GAP = max(0, _env_int("LOCAL_TTS_MIN_GAP_MS", 150)) / 1000.0
+LOCAL_TTS_TIMEOUT = max(20, _env_int("LOCAL_TTS_TIMEOUT", 90))  # seconds per chunk attempt
+# How many consecutive clean chunks before the limiter adds one more stream.
+LOCAL_TTS_GROW_AFTER = max(3, min(_env_int("LOCAL_TTS_GROW_AFTER", 8), 50))
+# Chunks kept in flight / buffered ahead of the writer (bounds memory).
+PIPELINE_WINDOW_EXTRA = 4
+# Minimum seconds between progress-message edits (Telegram flood protection;
+# every edit used to block the pipeline for a network round-trip).
+PROGRESS_EDIT_INTERVAL = max(2.0, _env_int("PROGRESS_EDIT_INTERVAL", 4))
 SUPPORTED_EXT = {".txt", ".md", ".docx", ".html", ".htm", ".epub", ".pdf"}
 FFMPEG = shutil.which("ffmpeg")
 
@@ -738,6 +761,43 @@ def _append_chunk(chunks: List[str], piece: str, max_len: int) -> None:
         chunks.append(piece)
 
 
+def edge_payload_bytes(text: str) -> int:
+    """Bytes Edge-TTS will put on the wire for ``text`` (XML-escaped UTF-8).
+
+    Microsoft's websocket accepts ~4096 bytes per message; edge-tts silently
+    splits anything bigger into several *sequential* connections, which is the
+    main reason Hindi (3 bytes/char) audiobooks felt slow.
+    """
+    return len(html.escape(text, quote=False).encode("utf-8"))
+
+
+def split_text_for_tts(text: str, max_chars: int, max_bytes: Optional[int] = None) -> List[str]:
+    """Sentence-aware chunking bounded by characters *and* (optionally) wire bytes.
+
+    Every returned chunk satisfies ``len(chunk) <= max_chars`` and, when
+    ``max_bytes`` is given, ``edge_payload_bytes(chunk) <= max_bytes`` so that each
+    chunk maps to exactly one Edge-TTS connection and all chunks can run in parallel.
+    """
+    chunks = split_text(text, max_chars)
+    if not max_bytes or max_bytes <= 0:
+        return chunks
+    out: List[str] = []
+    for chunk in chunks:
+        if edge_payload_bytes(chunk) <= max_bytes:
+            out.append(chunk)
+            continue
+        # Derive a character budget from this chunk's own byte density, then
+        # tighten it until every piece fits (density can vary inside a chunk).
+        density = edge_payload_bytes(chunk) / max(1, len(chunk))
+        budget = max(50, min(max_chars, int(max_bytes / density * 0.97)))
+        pieces = split_text(chunk, budget)
+        while any(edge_payload_bytes(p) > max_bytes for p in pieces) and budget > 50:
+            budget = max(50, int(budget * 0.85))
+            pieces = split_text(chunk, budget)
+        out.extend(pieces)
+    return [c for c in out if c.strip()]
+
+
 def split_chapters(text: str) -> List[Tuple[str, str]]:
     """Return [(title, body)] using chapter headings; single entry if none found."""
     matches = list(CHAPTER_RE.finditer(text))
@@ -840,6 +900,17 @@ class ServerPool:
     def concurrency(self) -> int:
         remote = sum(1 for s in self.states if not s.is_local)
         local = local_limiter.current if any(s.is_local for s in self.states) else 0
+        return max(1, min(MAX_TOTAL_CONCURRENCY, PER_SERVER_CONCURRENCY * remote + local))
+
+    def max_concurrency(self) -> int:
+        """Upper bound used to size the request pipeline.
+
+        The real per-engine throttles (``local_limiter`` / ``_server_slots``) are
+        enforced inside ``fetch_chunk``; this only has to be large enough that the
+        adaptive limiter can actually grow up to its ceiling mid-job.
+        """
+        remote = sum(1 for s in self.states if not s.is_local)
+        local = local_limiter.maximum if any(s.is_local for s in self.states) else 0
         return max(1, min(MAX_TOTAL_CONCURRENCY, PER_SERVER_CONCURRENCY * remote + local))
 
 
@@ -996,7 +1067,7 @@ class AdaptiveLimiter:
         self.maximum = max(1, maximum)
         self.current = max(1, min(start, self.maximum))
         self.min_gap = max(0.0, min_gap)
-        self.grow_after = 12
+        self.grow_after = LOCAL_TTS_GROW_AFTER
         self._active = 0
         self._streak = 0
         self._last_start = 0.0
@@ -1081,8 +1152,10 @@ def _make_local_communicate(text: str, voice: str, rate: str, pitch: str, volume
     """Build edge_tts.Communicate across edge-tts versions (boundary/pitch kwargs are newer)."""
     assert edge_tts is not None
     try:
+        # SentenceBoundary = far fewer metadata frames than WordBoundary (less
+        # websocket chatter per chunk) while still giving us the audio duration.
         return edge_tts.Communicate(text, voice, rate=rate, pitch=pitch, volume=volume,
-                                    boundary="WordBoundary", connect_timeout=15, receive_timeout=60)
+                                    boundary="SentenceBoundary", connect_timeout=15, receive_timeout=60)
     except TypeError:
         pass
     try:
@@ -1106,6 +1179,9 @@ async def _local_synth_once(text: str, settings: Dict[str, Any]) -> Tuple[bytes,
             duration_ms = max(duration_ms, int(start + dur))
     if len(audio) < 100:
         raise ThrottleError("Edge-TTS returned no audio (endpoint may be throttling)")
+    if duration_ms <= 0:
+        # Edge streams 48 kbit/s mono MP3 - derive the length from the byte count.
+        duration_ms = int(len(audio) * 8 / 48)
     return bytes(audio), duration_ms
 
 
@@ -2551,29 +2627,65 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: str
                     limits.append(LOCAL_TTS_CHUNK_SIZE)
                 chunk_limit = min([CHUNK_SIZE] + limits)
                 chapters = split_chapters(text) if settings["split_mode"] == "chapter" else [("Audiobook", text)]
-                plan = [(label, split_text(body, chunk_limit)) for label, body in chapters]
+                # Chunks are bounded by characters (server limits) AND by wire bytes so
+                # each one is exactly one Edge-TTS connection (see LOCAL_TTS_MAX_BYTES).
+                # Render servers run edge-tts too, so the same byte limit helps them.
+                plan = [(label, split_text_for_tts(body, chunk_limit, LOCAL_TTS_MAX_BYTES))
+                        for label, body in chapters]
                 total_chunks = sum(len(chunks) for _, chunks in plan)
-                # Fixed-size batches bound both request tasks and in-memory audio.
-                batch_size = min(8, pool.concurrency())
-                sem = asyncio.Semaphore(batch_size)
+                # Sliding-window pipeline: as soon as one chunk finishes the next one is
+                # submitted, so a single slow request never idles the other slots (the
+                # old fixed batches waited for the slowest chunk of every batch).  The
+                # window bounds both in-flight requests and audio buffered in memory.
+                parallel = pool.max_concurrency()
+                window = min(MAX_TOTAL_CONCURRENCY, parallel + PIPELINE_WINDOW_EXTRA)
+                sem = asyncio.Semaphore(parallel)
+                gen_started = time.monotonic()
+                last_edit = 0.0
+                last_access_check = time.monotonic()
+
+                async def report_progress(force: bool = False) -> None:
+                    nonlocal last_edit
+                    now = time.monotonic()
+                    if not force and now - last_edit < PROGRESS_EDIT_INTERVAL:
+                        return
+                    last_edit = now
+                    percent = int(done_chunks / total_chunks * 100) if total_chunks else 100
+                    elapsed = now - gen_started
+                    eta = elapsed / done_chunks * (total_chunks - done_chunks) if done_chunks else 0.0
+                    rate = (f" | {local_limiter.current}x parallel" if LOCAL_TTS_ENABLED
+                            and any(s.is_local for s in pool.states) else "")
+                    await safe_edit(status,
+                                    f"**Generating audiobook**\n"
+                                    f"[{progress_bar(percent)}] {percent}% ({done_chunks}/{total_chunks})\n"
+                                    f"Delivered: {delivered} parts | ETA {fmt_duration(eta)}{rate}",
+                                    cancel_markup)
+
+                await report_progress(force=True)
                 for label, chunks in plan:
                     part_label = label
-                    for offset in range(0, len(chunks), batch_size):
-                        if job.cancel.is_set():
-                            raise asyncio.CancelledError
-                        if not db.is_approved(uid):
-                            raise ValueError("Access expired or revoked during processing")
-                        batch = chunks[offset:offset + batch_size]
-                        tasks = [asyncio.create_task(fetch_chunk(session, pool, chunk, i, settings, sem, job.cancel))
-                                 for i, chunk in enumerate(batch)]
-                        try:
-                            results = await asyncio.gather(*tasks)
-                        finally:
-                            for task in tasks:
-                                if not task.done():
-                                    task.cancel()
-                            await asyncio.gather(*tasks, return_exceptions=True)
-                        for i, data, dur in results:
+                    pending: Dict[int, asyncio.Task] = {}
+                    next_submit = 0
+                    next_write = 0
+                    try:
+                        while next_write < len(chunks):
+                            if job.cancel.is_set():
+                                raise asyncio.CancelledError
+                            now = time.monotonic()
+                            if now - last_access_check >= 15:
+                                last_access_check = now
+                                if not db.is_approved(uid):
+                                    raise ValueError("Access expired or revoked during processing")
+                            # Keep the window full.
+                            while next_submit < len(chunks) and next_submit - next_write < window:
+                                pending[next_submit] = asyncio.create_task(
+                                    fetch_chunk(session, pool, chunks[next_submit], next_submit, settings, sem,
+                                                job.cancel))
+                                next_submit += 1
+                            # Consume strictly in order so the MP3 is written sequentially.
+                            _, data, dur = await pending.pop(next_write)
+                            chunk_text = chunks[next_write]
+                            next_write += 1
                             if not data:
                                 # Do not silently splice later text over a missing passage.
                                 raise RuntimeError(f"Chunk {done_chunks + 1} failed on all attempted servers. "
@@ -2587,17 +2699,16 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: str
                                 output.write(data)
                             part_bytes += len(data)
                             part_ms += dur
-                            part_chars += len(batch[i])
+                            part_chars += len(chunk_text)
                             done_chunks += 1
-                        results.clear()
-                        percent = int(done_chunks / total_chunks * 100)
-                        elapsed = time.monotonic() - started
-                        eta = elapsed / done_chunks * (total_chunks - done_chunks)
-                        await safe_edit(status,
-                                        f"**Generating audiobook**\n"
-                                        f"[{progress_bar(percent)}] {percent}% ({done_chunks}/{total_chunks})\n"
-                                        f"Delivered: {delivered} parts | ETA {fmt_duration(eta)}",
-                                        cancel_markup)
+                            await report_progress(force=done_chunks == total_chunks)
+                    finally:
+                        for task in pending.values():
+                            if not task.done():
+                                task.cancel()
+                        if pending:
+                            await asyncio.gather(*pending.values(), return_exceptions=True)
+                        pending.clear()
                     if settings["split_mode"] == "chapter":
                         await upload_part()
                 await upload_part()

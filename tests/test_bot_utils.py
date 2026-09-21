@@ -206,3 +206,32 @@ def test_pool_concurrency_accounts_for_local_engine():
     pool = bot.ServerPool(urls)
     expected = bot.PER_SERVER_CONCURRENCY + (bot.local_limiter.current if bot.LOCAL_TTS_ENABLED else 0)
     assert pool.concurrency() == min(bot.MAX_TOTAL_CONCURRENCY, expected)
+
+
+def test_split_text_for_tts_respects_byte_limit_for_hindi():
+    # Devanagari is 3 bytes/char: 3000 chars would be ~9 KB, i.e. several
+    # sequential Edge connections. The byte-aware splitter must keep every chunk
+    # inside one websocket message while preserving all text.
+    text = ("यह एक बहुत लंबा वाक्य है जिसमें कई शब्द हैं। " * 300).strip()
+    chunks = bot.split_text_for_tts(text, 3000, 3900)
+    assert chunks
+    assert all(len(c) <= 3000 for c in chunks)
+    assert all(bot.edge_payload_bytes(c) <= 3900 for c in chunks)
+    assert "".join(chunks).replace(" ", "").replace("\n", "") == text.replace(" ", "")
+    # ASCII text is not split more than the character limit requires.
+    ascii_text = ("Hello world, this is a test sentence. " * 200).strip()
+    assert bot.split_text_for_tts(ascii_text, 3000, 3900) == bot.split_text(ascii_text, 3000)
+
+
+def test_edge_payload_bytes_counts_xml_escaping():
+    assert bot.edge_payload_bytes("a&b") == len("a&amp;b")
+    assert bot.edge_payload_bytes("नमस्ते") == len("नमस्ते".encode("utf-8"))
+
+
+def test_adaptive_limiter_grows_and_shrinks():
+    lim = bot.AdaptiveLimiter(start=2, maximum=6, min_gap=0.0)
+    for _ in range(lim.grow_after):
+        lim.report_success()
+    assert lim.current == 3
+    pause = lim.report_throttle()
+    assert lim.current == 1 and pause > 0
