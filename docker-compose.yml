@@ -1,0 +1,27 @@
+services:
+  tts-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    environment:
+      - API_KEY=${TTS_API_KEY:-}
+      - MAX_CONCURRENCY=6
+    ports:
+      - "10000:10000"
+    restart: unless-stopped
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    env_file: .env
+    environment:
+      - TTS_API_KEY=${TTS_API_KEY:-}
+    volumes:
+      - bot-data:/app/data
+    depends_on:
+      - tts-server
+    restart: unless-stopped
+
+volumes:
+  bot-data:

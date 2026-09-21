@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+
+# Runtime artefacts
+*.db
+*.db-journal
+*.session
+*.session-journal
+*.log
+*.log.*
+downloads/
+tmp/
+*.mp3
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

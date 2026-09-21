@@ -1,0 +1,11 @@
+FROM python:3.12-slim
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements-bot.txt .
+RUN pip install --no-cache-dir -r requirements-bot.txt
+COPY bot.py .
+VOLUME ["/app/data"]
+ENV DB_PATH=/app/data/bot_database.db SESSION_NAME=/app/data/audiobook_pro_bot
+CMD ["python", "bot.py"]
