@@ -269,3 +269,59 @@ def test_read_text_file_encodings(tmp_path):
         p = tmp_path / f"{name}.txt"
         p.write_bytes(raw)
         assert bot.clean_text(bot._read_text_file(str(p)))
+
+
+def test_plan_limits_uses_strictest_engine():
+    probes = [{"ok": True, "max_text_length": 2000}, {"ok": True, "max_text_length": 5000}, {"ok": True}]
+    chunk_limit, max_bytes = bot.plan_limits(probes)
+    assert chunk_limit == min(2000, bot.CHUNK_SIZE, bot.LOCAL_TTS_CHUNK_SIZE if bot.LOCAL_TTS_ENABLED else 10**9)
+    assert max_bytes == bot.LOCAL_TTS_MAX_BYTES
+    # No remote servers -> CHUNK_SIZE / built-in engine limits only
+    chunk_limit2, _ = bot.plan_limits([])
+    assert chunk_limit2 <= bot.CHUNK_SIZE
+    # Garbage in the probe list is ignored
+    chunk_limit3, _ = bot.plan_limits([{"max_text_length": -5}, {"max_text_length": "x"}, None])
+    assert chunk_limit3 == chunk_limit2
+
+
+def test_server_pool_prefers_least_loaded_engine():
+    bot._remote_limiters.clear()
+    pool = bot.ServerPool(["https://a.example.com", "https://b.example.com"])
+    a, b = pool.states
+    lim_a = bot.remote_limiter(a.url)
+    lim_b = bot.remote_limiter(b.url)
+    lim_a.current = lim_b.current = 4
+    # Fill up A -> B has more free slots and must be chosen.
+    lim_a._active = 4
+    lim_b._active = 1
+    for _ in range(5):
+        assert pool.pick() is b
+    # Cooling servers are skipped while another engine is live.
+    lim_a._active = 0
+    b.cooldown_until = bot.time.time() + 60
+    assert pool.pick() is a
+    # Chars are accounted on success.
+    pool.report(a, True, 0.5, chars=1234)
+    assert a.chars_done == 1234
+    bot._remote_limiters.clear()
+
+
+def test_server_pool_apply_probe_clamps_to_advertised_limit():
+    bot._remote_limiters.clear()
+    url = "https://c.example.com"
+    pool = bot.ServerPool([url])
+    lim = bot.remote_limiter(url)
+    lim.current = lim.maximum = 8
+    pool.apply_probe(url, {"ok": True, "max_concurrency": 3})
+    assert lim.maximum == 3
+    assert lim.current <= 3
+    assert pool.states[0].advertised_limit == 3
+    # Unknown / invalid values leave the limiter alone.
+    pool.apply_probe(url, {"ok": True, "max_concurrency": "many"})
+    assert lim.maximum == 3
+    # A healthy server with a big limit starts at PER_SERVER_CONCURRENCY at least.
+    lim.current = 1
+    pool.apply_probe(url, {"ok": True, "max_concurrency": 8})
+    assert lim.maximum == 8
+    assert lim.current >= min(8, bot.PER_SERVER_CONCURRENCY)
+    bot._remote_limiters.clear()

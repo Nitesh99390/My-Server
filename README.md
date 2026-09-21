@@ -9,7 +9,20 @@ neural voices** (`edge-tts`) — no API key, no paid TTS service.
 | `bot.py` | Telegram bot (Pyrogram/MTProto, uploads up to 2 GB). **Built-in free Edge-TTS engine**, chunking, chapter splitting, optional multi-server load balancing, progress bar, user approval system, admin panel. |
 | `app.py` | *Optional* Flask micro-service wrapping `edge-tts` for extra render capacity on other IPs. `/tts`, `/tts/stream`, `/tts/subtitles`, `/voices`, `/health`, `/stats`. |
 
-Version: **4.0.0**
+Version: **bot 4.2.0 / server 4.0.0**
+
+---
+
+## ⚡ v4.2: multi-server throughput - every engine busy, all the time
+
+| Problem in v4.1 | v4.2 behaviour |
+|-----------------|----------------|
+| Finishing a part (ffmpeg remux + Telegram upload of hundreds of MB) ran **inline** and froze all engines for minutes | Parts are handed to a **background uploader** (single worker → parts still arrive in order). Synthesis never stops; progress shows *"Uploading part N in background"*. |
+| Round-robin scheduling sent the next chunk to a busy/slow server while a fast one sat idle | **Least-loaded scheduling**: the engine with the most free parallel slots gets the chunk, ties broken by latency. |
+| Remote limiter grew slowly (`LOCAL_TTS_GROW_AFTER=8`) and capped at 2× start | Per-server limiter grows every `REMOTE_GROW_AFTER=3` clean chunks up to `PER_SERVER_MAX_CONCURRENCY=8`, **clamped to the `max_concurrency` the server advertises on `/health`** so requests are never queued on a full server. |
+| A `503 slots in use` (server full) was treated like Microsoft throttling → long cooldown on a healthy server | Recognised as *"we sent one too many"*: trim the limit by one, fail over **immediately** to a free engine, 1 s cooldown only. Sleeping inside a slot only happens when *every* engine is cooling down. |
+| Progress/ETA counted chunks (very different sizes) | Progress/ETA/speed computed on **characters** (`chars/s`, `x realtime`) plus live `active/limit requests in flight`. |
+| Chunk plan ignored byte limits when render servers were used | `plan_limits()` sizes chunks by the strictest engine (`max_text_length` of every server, `CHUNK_SIZE`, built-in engine) **and** Edge's ~4 KB/message budget → exactly one Edge connection per chunk on every engine. |
 
 ---
 
@@ -21,7 +34,7 @@ Version: **4.0.0**
 | Bot restart / Render sleep → job lost | Every chunk is **checkpointed** to `JOBS_DIR/<job>/chunks/`, the cursor is stored in SQLite. Jobs auto-resume on start (`RESUME_ON_START`) or with `/resume`. Delivered parts are never re-sent. |
 | `MAX_EXTRACTED_CHARS=2,000,000` rejected big Hindi EPUBs | Streaming extractor (EPUB spine item-by-item, PDF page-by-page) writes straight to disk; default cap 50 M chars, files up to `MAX_FILE_MB=200`. |
 | Render server: retry budget shared with queue wait → `502 NoAudioReceived` under load while `/servers` showed 4/4 green | `app.py` holds a slot for **one** connection only; waiting for a slot returns `503 + Retry-After` so the bot instantly fails over. `/health` exposes `throttled`, `queued`. |
-| Only the built-in engine had an adaptive limiter; remote servers used a fixed semaphore | **One adaptive limiter per server** (starts at `PER_SERVER_CONCURRENCY`, grows to 2× while healthy, halves on 429/502/503/timeout). Throughput scales linearly with servers; `MAX_TOTAL_CONCURRENCY=64` is the only global cap. |
+| Only the built-in engine had an adaptive limiter; remote servers used a fixed semaphore | **One adaptive limiter per server** (starts at `PER_SERVER_CONCURRENCY`, grows to `PER_SERVER_MAX_CONCURRENCY` while healthy, halves on 429/502/504/timeout). Throughput scales linearly with servers; `MAX_TOTAL_CONCURRENCY=64` is the only global cap. |
 | `/servers` probe said "OK" with a 2-letter text | Probe is a real ~120-char Hindi synthesis on every engine and shows each server's live limit / throttle count. |
 
 New commands: `/resume` (user) · `/jobs` (admin: running / paused / interrupted jobs with progress and last stall reason).
