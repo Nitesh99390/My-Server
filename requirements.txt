@@ -1,5 +1,6 @@
 # ---- Shared ----
 aiohttp>=3.9
+edge-tts>=6.1.12
 
 # ---- Telegram bot (bot.py) ----
 pyrogram>=2.0.106
@@ -12,5 +13,4 @@ pypdf>=4.0
 
 # ---- Edge-TTS render server (app.py) ----
 flask>=3.0
-edge-tts>=6.1.12
 gunicorn>=22.0

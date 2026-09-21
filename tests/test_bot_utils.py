@@ -61,3 +61,69 @@ def test_database_servers_and_users():
     assert sorted(db.servers()) == ["https://s1.example.com", "https://s2.example.com"]
     db.remove_server("https://s1.example.com")
     assert db.servers() == ["https://s2.example.com"]
+
+
+# ---------------------------------------------------------------------------
+# Built-in free Edge-TTS engine helpers
+# ---------------------------------------------------------------------------
+def test_backend_urls_puts_local_engine_last():
+    urls = bot.backend_urls(["https://a.example", "", "https://b.example"])
+    assert urls[:2] == ["https://a.example", "https://b.example"]
+    if bot.LOCAL_TTS_ENABLED:
+        assert urls[-1] == bot.LOCAL_TTS_URL
+        assert bot.ServerState(bot.LOCAL_TTS_URL).is_local
+    assert not bot.ServerState("https://a.example").is_local
+
+
+def test_is_throttle_error_classification():
+    assert bot._is_throttle_error(bot.ThrottleError("x"))
+    assert bot._is_throttle_error(RuntimeError("HTTP 403 forbidden"))
+    assert bot._is_throttle_error(RuntimeError("too many requests"))
+    assert not bot._is_throttle_error(ValueError("bad text"))
+
+
+def test_adaptive_limiter_shrinks_and_grows():
+    lim = bot.AdaptiveLimiter(start=4, maximum=6, min_gap=0)
+    assert lim.current == 4
+    pause = lim.report_throttle()
+    assert lim.current == 2 and pause > 0
+    lim.report_throttle()
+    assert lim.current == 1
+    for _ in range(lim.grow_after):
+        lim.report_success()
+    assert lim.current == 2
+    for _ in range(lim.grow_after * 10):
+        lim.report_success()
+    assert lim.current == 6  # never above maximum
+
+
+def test_adaptive_limiter_enforces_concurrency():
+    import asyncio
+
+    async def run():
+        lim = bot.AdaptiveLimiter(start=2, maximum=2, min_gap=0)
+        peak = 0
+        running = 0
+
+        async def worker():
+            nonlocal peak, running
+            await lim.acquire()
+            try:
+                running += 1
+                peak = max(peak, running)
+                await asyncio.sleep(0.02)
+                running -= 1
+            finally:
+                await lim.release()
+
+        await asyncio.gather(*(worker() for _ in range(8)))
+        return peak
+
+    assert asyncio.run(run()) == 2
+
+
+def test_pool_concurrency_accounts_for_local_engine():
+    urls = bot.backend_urls(["https://a.example"])
+    pool = bot.ServerPool(urls)
+    expected = bot.PER_SERVER_CONCURRENCY + (bot.local_limiter.current if bot.LOCAL_TTS_ENABLED else 0)
+    assert pool.concurrency() == min(bot.MAX_TOTAL_CONCURRENCY, expected)

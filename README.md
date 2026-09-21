@@ -1,19 +1,41 @@
 # AudioBook Pro — Telegram TTS Bot + Edge-TTS Render Server
 
 Convert novels, stories and documents (`.txt .md .docx .html .epub .pdf` or plain
-messages) into MP3 audiobooks directly from Telegram, using a pool of
-Microsoft Edge neural-voice render servers.
+messages) into MP3 audiobooks directly from Telegram, using **free Microsoft Edge
+neural voices** (`edge-tts`) — no API key, no paid TTS service.
 
 | File | Role |
 |------|------|
-| `bot.py` | Telegram bot (Pyrogram/MTProto, uploads up to 2 GB). Chunking, chapter splitting, multi-server load balancing, progress bar, user approval system, admin panel. |
-| `app.py` | Flask micro-service wrapping `edge-tts`. `/tts`, `/tts/stream`, `/tts/subtitles`, `/voices`, `/health`, `/stats`. API-key auth, rate-limit, in-memory cache. |
+| `bot.py` | Telegram bot (Pyrogram/MTProto, uploads up to 2 GB). **Built-in free Edge-TTS engine**, chunking, chapter splitting, optional multi-server load balancing, progress bar, user approval system, admin panel. |
+| `app.py` | *Optional* Flask micro-service wrapping `edge-tts` for extra render capacity on other IPs. `/tts`, `/tts/stream`, `/tts/subtitles`, `/voices`, `/health`, `/stats`. |
 
-Version: **3.1.0**
+Version: **3.2.0**
 
 ---
 
-## 1. Deploy render servers (`app.py`)
+## 0. How the free Edge-TTS engine stays fast *and* error-free
+
+Microsoft's free endpoint throttles an IP that opens too many streams at once
+(HTTP 403 / dropped websockets). The bot therefore uses an **adaptive limiter**:
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `LOCAL_TTS_ENABLED` | `true` | Synthesise directly inside the bot (no render server needed). |
+| `LOCAL_TTS_CONCURRENCY` | `3` | Parallel Edge-TTS streams to start with. |
+| `LOCAL_TTS_MAX_CONCURRENCY` | `5` | Ceiling. Grows +1 after 12 clean chunks, halves on any throttle signal. |
+| `LOCAL_TTS_CHUNK_SIZE` | `2500` | Characters per request. |
+| `LOCAL_TTS_RETRIES` | `4` | Attempts per chunk, exponential back-off + jitter. |
+| `LOCAL_TTS_MIN_GAP_MS` | `250` | Minimum spacing between new connections (no bursts). |
+
+Result: ~3–5× faster than sequential generation while automatically backing off
+before Microsoft blocks the IP. Works on Render even though the outbound IP changes —
+the limiter is per-process, so a new IP simply starts fresh.
+
+If you also add external render servers (`app.py`), they are used **first** (more
+IPs = more total throughput) and the built-in engine acts as an always-available
+fallback.
+
+## 1. (Optional) Deploy render servers (`app.py`)
 
 Deploy one or more copies (Render free tier works). The bot load-balances across all of them.
 
@@ -27,8 +49,8 @@ docker build -f Dockerfile.server -t tts-server .
 docker run -p 10000:10000 -e API_KEY=mysecret tts-server
 ```
 
-Key env vars: `PORT`, `API_KEY`, `MAX_TEXT_LENGTH=6000`, `MAX_CONCURRENCY=6`,
-`RATE_LIMIT=120`, `CACHE_MAX_MB=64`, `TRUST_PROXY_HOPS=1` (behind Render/Cloudflare).
+Key env vars: `PORT`, `API_KEY`, `MAX_TEXT_LENGTH=6000`, `MAX_CONCURRENCY=4` (keep ≤ 6 per IP),
+`MIN_START_GAP_MS=200`, `RATE_LIMIT=120`, `CACHE_MAX_MB=64`, `TRUST_PROXY_HOPS=1` (behind Render/Cloudflare).
 
 Quick test:
 ```bash
@@ -57,8 +79,10 @@ Docker Compose (server + bot together):
 docker compose up -d --build
 ```
 
-Then in Telegram: **Admin Panel → ➕ Add Server** and paste each render-server URL.
-`TTS_API_KEY` in the bot must equal `API_KEY` on the servers.
+The bot works immediately with the built-in free engine. To add extra capacity,
+in Telegram: **Admin Panel → ➕ Add Server** and paste each render-server URL
+(`TTS_API_KEY` in the bot must equal `API_KEY` on the servers). `/servers` shows
+the built-in engine's current parallel limit and throttle count.
 
 ## 3. Usage
 
@@ -80,8 +104,8 @@ python -m pytest tests -q
 ## 5. Layout
 
 ```
-app.py                 Edge-TTS render server
-bot.py                 Telegram bot
+app.py                 Edge-TTS render server (optional)
+bot.py                 Telegram bot with built-in free Edge-TTS engine
 requirements*.txt      full / server-only / bot-only deps
 .env.example           all environment variables
 Dockerfile.server / Dockerfile.bot / docker-compose.yml

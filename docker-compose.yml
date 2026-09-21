@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile.server
     environment:
       - API_KEY=${TTS_API_KEY:-}
-      - MAX_CONCURRENCY=6
+      - MAX_CONCURRENCY=4
     ports:
       - "10000:10000"
     restart: unless-stopped
