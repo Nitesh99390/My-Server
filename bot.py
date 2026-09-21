@@ -125,7 +125,7 @@ except ImportError:  # pragma: no cover
 # =============================================================================
 # Configuration
 # =============================================================================
-VERSION = "4.1.0"
+VERSION = "4.1.1"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -752,6 +752,8 @@ def extract_text_to_file(path: str, ext: str, out_path: str) -> int:
     in memory as one giant string (the old ``"\\n".join(texts)`` doubled RAM).
     Each written piece is already passed through :func:`clean_text`.
     """
+    if os.path.abspath(path) == os.path.abspath(out_path):
+        raise ValueError("Extraction output path must differ from the source path")
     total = 0
     with open(out_path, "w", encoding="utf-8") as out:
         def emit(piece: str) -> None:
@@ -2760,12 +2762,17 @@ async def document_job(client, message, job, name, ext):
         if os.path.getsize(path) > MAX_FILE_MB * 1024 * 1024:
             raise ValueError("Downloaded file exceeds the size limit")
         await safe_edit(status, f"Extracting text from {fmt_size(os.path.getsize(path))} file...")
-        text_path = os.path.join(tmpdir, "source.txt")
+        # NOTE: must NOT be "source.txt" - a .txt upload is downloaded to exactly
+        # that path, and opening it for writing would truncate the source before
+        # it is read (every .txt used to fail with "No readable text found").
+        text_path = os.path.join(tmpdir, "extracted.utf8")
         # Stream-extract straight to disk: EPUB/PDF are processed item by item.
         extraction = asyncio.create_task(asyncio.to_thread(extract_text_to_file, path, ext, text_path))
         chars = await asyncio.shield(extraction)
         if chars <= 0:
-            raise ValueError("No readable text found. Scanned PDFs need OCR before uploading")
+            if ext == ".pdf":
+                raise ValueError("No readable text found. Scanned PDFs need OCR before uploading")
+            raise ValueError(f"No readable text found in this {ext} file (it appears to be empty)")
         await run_audiobook_job(client, status, job.user_id, text_path=text_path, source=name,
                                title=os.path.splitext(name)[0], job=job)
     except asyncio.CancelledError:

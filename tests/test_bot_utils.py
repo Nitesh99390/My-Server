@@ -235,3 +235,37 @@ def test_adaptive_limiter_grows_and_shrinks():
     assert lim.current == 3
     pause = lim.report_throttle()
     assert lim.current == 1 and pause > 0
+
+
+def test_extract_text_to_file_txt_upload_like_document_job(tmp_path):
+    """Regression: a .txt upload used to be truncated because the extraction
+    output path was also '<tmpdir>/source.txt' (the download path)."""
+    tmpdir = tmp_path / "abp_source_x"
+    tmpdir.mkdir()
+    ext = ".txt"
+    src = tmpdir / ("source" + ext)
+    src.write_text("अध्याय 1\n\nयह एक कहानी है। राम वन में गया।\n", encoding="utf-8")
+    out = tmpdir / "extracted.utf8"
+    chars = bot.extract_text_to_file(str(src), ext, str(out))
+    assert chars > 0
+    assert "कहानी" in out.read_text(encoding="utf-8")
+    # Same path in and out must be refused instead of silently wiping the source
+    import pytest
+    with pytest.raises(ValueError):
+        bot.extract_text_to_file(str(src), ext, str(src))
+    assert src.stat().st_size > 0
+
+
+def test_read_text_file_encodings(tmp_path):
+    import codecs
+    cases = {
+        "utf8": "Hello दुनिया।".encode("utf-8"),
+        "utf8_bom": codecs.BOM_UTF8 + b"Hello world",
+        "utf16": "नमस्ते दुनिया".encode("utf-16"),
+        "cp1252": b"Hello \x93quoted\x94 text",
+        "crlf": b"Line one.\r\nLine two.\r\n",
+    }
+    for name, raw in cases.items():
+        p = tmp_path / f"{name}.txt"
+        p.write_bytes(raw)
+        assert bot.clean_text(bot._read_text_file(str(p)))
