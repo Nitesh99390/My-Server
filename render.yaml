@@ -1,0 +1,20 @@
+# Render Blueprint - deploy one or more Edge-TTS render servers.
+# Duplicate the "tts-server-1" block to add more servers, then register each
+# URL in the bot with  "Admin Panel -> Add Server".
+services:
+  - type: web
+    name: tts-server-1
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements-server.txt
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 300
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.4"
+      - key: API_KEY
+        sync: false
+      - key: MAX_CONCURRENCY
+        value: "6"
+      - key: TRUST_PROXY_HOPS
+        value: "1"
