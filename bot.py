@@ -57,6 +57,7 @@ import uuid
 import zipfile
 from urllib.parse import urlsplit, urlunsplit
 import html
+import json
 import logging
 import os
 import random
@@ -141,7 +142,9 @@ API_HASH = _env("API_HASH")
 BOT_TOKEN = _env("BOT_TOKEN")
 OWNER_ID = _env_int("OWNER_ID", 0)
 CONTACT_USERNAME = _env("CONTACT_USERNAME", "Niteshbhumihar")
-TTS_API_KEY = _env("TTS_API_KEY", "")
+# Shared secret for render servers.  Fall back to API_KEY so a single .env shared
+# between bot.py and app.py "just works" instead of producing silent HTTP 401s.
+TTS_API_KEY = _env("TTS_API_KEY", "") or _env("API_KEY", "")
 
 CHUNK_SIZE = max(500, min(_env_int("CHUNK_SIZE", 3000), 6000))
 PER_SERVER_CONCURRENCY = max(1, _env_int("PER_SERVER_CONCURRENCY", 4))
@@ -772,6 +775,11 @@ class ServerState:
     successes: int = 0
     latency: float = 0.0
     cooldown_until: float = 0.0
+    last_error: str = ""
+
+    @property
+    def label(self) -> str:
+        return "built-in Edge-TTS" if self.is_local else self.url
 
     @property
     def tts_url(self) -> str:
@@ -808,16 +816,26 @@ class ServerPool:
             return min(live, key=lambda s: s.score)
         return live[self._rr % len(live)]
 
-    def report(self, s: ServerState, ok: bool, latency: float = 0.0) -> None:
+    def report(self, s: ServerState, ok: bool, latency: float = 0.0, error: str = "") -> None:
         if ok:
             s.cooldown_until = 0
             s.successes += 1
             s.failures = max(0, s.failures - 1)
             s.latency = latency if not s.latency else (s.latency * 0.7 + latency * 0.3)
+            s.last_error = ""
         else:
             s.failures += 1
+            if error:
+                s.last_error = error[:200]
             if s.failures >= 3:
                 s.cooldown_until = time.time() + min(120, 15 * s.failures)
+
+    def failure_summary(self) -> str:
+        """Human readable 'why did every engine fail' text for error messages."""
+        parts = [f"{s.label} -> {s.last_error}" for s in self.states if s.last_error]
+        if not parts:
+            parts = [f"{s.label} -> no response" for s in self.states]
+        return "; ".join(parts)
 
     def concurrency(self) -> int:
         remote = sum(1 for s in self.states if not s.is_local)
@@ -832,12 +850,64 @@ def _headers() -> Dict[str, str]:
     return h
 
 
-async def check_server(session: aiohttp.ClientSession, url: str) -> Dict[str, Any]:
-    """Probe /health (preferred) or / for a render server."""
-    info: Dict[str, Any] = {"url": url, "ok": False, "latency": None, "version": None, "active": None}
+async def _describe_http_error(resp: aiohttp.ClientResponse) -> str:
+    """Short, user-facing reason for a non-200 render-server reply."""
+    detail = ""
+    try:
+        body = await resp.text()
+        try:
+            j = json.loads(body)
+            detail = str(j.get("error") or j.get("message") or "") if isinstance(j, dict) else ""
+        except ValueError:
+            detail = body.strip()
+    except Exception:  # noqa: BLE001
+        pass
+    detail = re.sub(r"\s+", " ", detail)[:120]
+    if resp.status == 401:
+        hint = ("API key rejected - set TTS_API_KEY on the bot to the same value as API_KEY on the server"
+                if TTS_API_KEY else "server requires an API key - set TTS_API_KEY on the bot (same as API_KEY on the server)")
+        return f"HTTP 401: {hint}"
+    if resp.status == 404:
+        return "HTTP 404: /tts endpoint not found (is this really an app.py render server?)"
+    if resp.status == 429:
+        return f"HTTP 429: rate limited{(' - ' + detail) if detail else ''}"
+    return f"HTTP {resp.status}{(': ' + detail) if detail else ''}"
+
+
+async def probe_tts(session: aiohttp.ClientSession, url: str) -> Tuple[bool, str]:
+    """Authenticated end-to-end /tts probe: proves the bot can actually render on this server."""
+    payload = {"text": "OK", "voice": DEFAULT_VOICE, "rate": "+0%", "pitch": "+0Hz", "volume": "+0%"}
+    try:
+        async with session.post(f"{url}/tts", json=payload, headers=_headers(), allow_redirects=False,
+                                timeout=aiohttp.ClientTimeout(total=60)) as r:
+            if r.status != 200:
+                return False, await _describe_http_error(r)
+            data = await r.content.read(4096)
+            mp3 = data.startswith(b"ID3") or (len(data) >= 2 and data[0] == 255 and data[1] & 224 == 224)
+            if not mp3:
+                return False, "HTTP 200 but response is not MP3 audio (proxy / login page?)"
+            return True, ""
+    except asyncio.TimeoutError:
+        return False, "timed out waiting for /tts (server asleep or overloaded)"
+    except aiohttp.ClientError as exc:
+        return False, f"connection error: {type(exc).__name__}"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {str(exc)[:80]}"
+
+
+async def check_server(session: aiohttp.ClientSession, url: str, deep: bool = False) -> Dict[str, Any]:
+    """Probe /health (preferred) or / for a render server.
+
+    With ``deep=True`` an authenticated ``/tts`` request is made as well, so an
+    API-key mismatch or broken synthesis shows up as ``ok=False`` with a reason
+    instead of every chunk failing later during a real job.
+    """
+    info: Dict[str, Any] = {"url": url, "ok": False, "latency": None, "version": None, "active": None,
+                            "error": "", "auth_required": None}
     if url == LOCAL_TTS_URL:
         return await local_engine_health()
     if not normalize_server_url(url):
+        info["error"] = "invalid URL"
         return info
     t0 = time.time()
     try:
@@ -848,25 +918,41 @@ async def check_server(session: aiohttp.ClientSession, url: str) -> Dict[str, An
                 try:
                     j = await r.json(content_type=None)
                     if not isinstance(j, dict) or j.get("status") != "ok":
+                        info["error"] = "/health did not return status=ok"
                         return info
                     info["version"] = j.get("version")
                     info["active"] = j.get("active_jobs")
+                    info["auth_required"] = j.get("auth_required")
                     limit = j.get("max_text_length")
                     if isinstance(limit, int) and limit > 0:
                         info["max_text_length"] = limit
                 except (ValueError, TypeError):
+                    info["error"] = "/health returned invalid JSON"
                     return info
                 info["ok"] = True
-                return info
-    except Exception:
-        pass
-    try:
-        t0 = time.time()
-        async with session.get(url, headers=_headers(), timeout=aiohttp.ClientTimeout(total=25)) as r:
-            info["latency"] = round(time.time() - t0, 2)
-            info["ok"] = r.status == 200 and (await r.text()).strip() == "OK"
-    except Exception:
+            else:
+                info["error"] = await _describe_http_error(r)
+    except Exception as exc:  # noqa: BLE001
+        info["error"] = f"unreachable ({type(exc).__name__})"
+    if not info["ok"] and not info["version"]:
+        try:
+            t0 = time.time()
+            async with session.get(url, headers=_headers(), timeout=aiohttp.ClientTimeout(total=25)) as r:
+                info["latency"] = round(time.time() - t0, 2)
+                if r.status == 200 and (await r.text()).strip() == "OK":
+                    info["ok"] = True
+                    info["error"] = ""
+        except Exception:  # noqa: BLE001
+            pass
+    if info["ok"] and info.get("auth_required") and not TTS_API_KEY:
         info["ok"] = False
+        info["error"] = "server requires an API key but TTS_API_KEY is not set on the bot"
+        return info
+    if info["ok"] and deep:
+        ok, reason = await probe_tts(session, url)
+        if not ok:
+            info["ok"] = False
+            info["error"] = reason
     return info
 
 
@@ -1023,14 +1109,32 @@ async def _local_synth_once(text: str, settings: Dict[str, Any]) -> Tuple[bytes,
     return bytes(audio), duration_ms
 
 
+def _describe_exc(exc: Optional[BaseException]) -> str:
+    if exc is None:
+        return "unknown error"
+    text = re.sub(r"\s+", " ", str(exc)).strip()
+    name = type(exc).__name__
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timed out"
+    if "403" in text or name == "WSServerHandshakeError":
+        return f"{name}: Microsoft Edge endpoint refused the connection (HTTP 403 - IP throttled / blocked)"
+    return f"{name}: {text[:120]}" if text else name
+
+
+local_last_error: str = ""
+
+
 async def local_synthesize(text: str, settings: Dict[str, Any], cancel: asyncio.Event,
                            attempts: int = LOCAL_TTS_RETRIES) -> Tuple[Optional[bytes], int]:
     """Synthesise one chunk with the free Edge-TTS endpoint.
 
     Uses the adaptive limiter so we stay fast but under Microsoft's per-IP limits,
     and retries with exponential back-off + jitter on throttle-like errors.
+    The reason for the last failure is kept in ``local_last_error``.
     """
+    global local_last_error
     if not LOCAL_TTS_ENABLED:
+        local_last_error = "built-in engine disabled (edge-tts not installed or LOCAL_TTS_ENABLED=false)"
         return None, 0
     last_exc: Optional[BaseException] = None
     for attempt in range(1, attempts + 1):
@@ -1058,7 +1162,8 @@ async def local_synthesize(text: str, settings: Dict[str, Any], cancel: asyncio.
         if attempt < attempts:
             backoff = min(45.0, (1.5 ** attempt) + pause + random.uniform(0.2, 1.2))
             await cancellable_sleep(backoff, cancel)
-    log.error("Edge-TTS chunk failed after %d attempts: %s", attempts, last_exc)
+    local_last_error = _describe_exc(last_exc)
+    log.error("Edge-TTS chunk failed after %d attempts: %s", attempts, local_last_error)
     return None, 0
 
 
@@ -1077,8 +1182,10 @@ async def local_engine_health() -> Dict[str, Any]:
     """Tiny synthesis probe used by /servers and the admin panel."""
     info: Dict[str, Any] = {"url": LOCAL_TTS_URL, "ok": False, "latency": None,
                             "version": getattr(edge_tts, "__version__", None) if edge_tts else None,
-                            "active": local_limiter.active, "max_text_length": LOCAL_TTS_CHUNK_SIZE}
+                            "active": local_limiter.active, "max_text_length": LOCAL_TTS_CHUNK_SIZE,
+                            "error": ""}
     if not LOCAL_TTS_ENABLED:
+        info["error"] = "disabled"
         return info
     t0 = time.time()
     try:
@@ -1094,6 +1201,7 @@ async def local_engine_health() -> Dict[str, Any]:
         local_limiter.report_success()
     except Exception as exc:  # noqa: BLE001
         info["latency"] = round(time.time() - t0, 2)
+        info["error"] = _describe_exc(exc)
         if _is_throttle_error(exc):
             local_limiter.report_throttle()
     return info
@@ -1138,6 +1246,7 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
             if server.is_local:
                 # Built-in free Edge-TTS engine: no HTTP hop, adaptive throttle-safe limiter.
                 if len(chunk) > LOCAL_TTS_CHUNK_SIZE:
+                    pool.report(server, False, error=f"chunk longer than LOCAL_TTS_CHUNK_SIZE ({LOCAL_TTS_CHUNK_SIZE})")
                     rejected.add(server.url)
                     continue
                 t0 = time.monotonic()
@@ -1145,7 +1254,7 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
                 if data:
                     pool.report(server, True, time.monotonic() - t0)
                     return index, data, dur
-                pool.report(server, False)
+                pool.report(server, False, error=local_last_error or "Edge-TTS returned no audio")
                 if len(pool.states) == 1:
                     # Nothing else to fail over to; the engine already retried internally.
                     break
@@ -1179,24 +1288,37 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
                                     dur = max(1, round(estimate_seconds(len(chunk), settings["rate"]) * 1000))
                                 pool.report(server, True, time.monotonic() - t0)
                                 return index, bytes(data), dur
+                            pool.report(server, False,
+                                        error=f"HTTP 200 but body is not MP3 ({content_type or 'no content-type'}, {len(data)} bytes)")
                         elif resp.status in (400, 401, 403, 413, 404, 405):
+                            reason = await _describe_http_error(resp)
                             rejected.add(server.url)
-                            log.warning("Chunk %d rejected by %s (HTTP %s); trying another server without truncation",
-                                        index, server.url, resp.status)
+                            if resp.status in (401, 404):
+                                # Configuration problem - this server will reject every chunk, stop hammering it.
+                                server.cooldown_until = time.time() + 300
+                            pool.report(server, False, error=reason)
+                            log.warning("Chunk %d rejected by %s (%s); trying another server without truncation",
+                                        index, server.url, reason)
                         elif resp.status == 429:
                             try:
                                 retry_after = min(120, max(1, float(resp.headers.get("Retry-After", "5"))))
                             except ValueError:
                                 retry_after = 5
                             server.cooldown_until = time.time() + retry_after
-                        pool.report(server, False)
+                            pool.report(server, False, error=f"HTTP 429 rate limited (retry in {retry_after:.0f}s)")
+                        else:
+                            pool.report(server, False, error=await _describe_http_error(resp))
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError:
+                pool.report(server, False, error=f"timed out after {CHUNK_TIMEOUT}s")
+                log.debug("Chunk %d attempt %d timed out on %s", index, attempt, server.url)
             except Exception as exc:
-                pool.report(server, False)
+                pool.report(server, False, error=_describe_exc(exc))
                 log.debug("Chunk %d attempt %d failed on %s: %s", index, attempt, server.url, exc)
             if attempt < MAX_CHUNK_ATTEMPTS and len(rejected) < len(pool.states):
                 await cancellable_sleep(retry_after, cancel)
+    log.error("Chunk %d failed on every engine: %s", index, pool.failure_summary())
     return index, None, 0
 
 
@@ -1749,7 +1871,8 @@ async def send_voice_preview(client: Client, chat_id: int, uid: int, reply_to: O
     async with aiohttp.ClientSession() as session:
         _, data, dur = await fetch_chunk(session, pool, sample, 0, settings, asyncio.Semaphore(1), asyncio.Event())
     if not data:
-        await safe_send(client, chat_id, "❌ Preview failed — the TTS engine is unreachable right now. Try again in a minute.")
+        await safe_send(client, chat_id, "❌ Preview failed — " + html.escape(pool.failure_summary())[:500]
+                        + "\n\nTry again in a minute or ask the administrator to check /servers.")
         return
     fd, path = tempfile.mkstemp(prefix=f"preview_{uid}_", suffix=".mp3")
     with os.fdopen(fd, "wb") as f:
@@ -1913,9 +2036,9 @@ async def btn_server_status(client: Client, message: Message):
     if not servers:
         await message.reply("No TTS engine available. Use ➕ Add Server or install `edge-tts` on the bot host.")
         return
-    msg = await message.reply(f"🔄 Checking {len(servers)} engine(s)…")
+    msg = await message.reply(f"🔄 Checking {len(servers)} engine(s) (including a real test synthesis)…")
     async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(*(check_server(session, s) for s in servers))
+        results = await asyncio.gather(*(check_server(session, s, deep=True) for s in servers))
     lines = [f"🌐 **TTS Engine Status** ({len(servers)} total)\n"]
     online = 0
     for i, r in enumerate(results, 1):
@@ -1931,10 +2054,15 @@ async def btn_server_status(client: Client, message: Message):
             if is_local:
                 snap = local_limiter.snapshot()
                 extra += f" · limit {snap['limit']}/{snap['max']} · throttles {snap['throttle_events']}"
+            if not is_local:
+                extra += " · 🔐 auth OK" if r.get("auth_required") else " · 🔓 no key"
             lines.append(f"{i}. 🟢 `{label}`{extra}")
         else:
-            lines.append(f"{i}. 🔴 `{label}` — offline")
+            reason = html.escape(r.get("error") or "offline")[:200]
+            lines.append(f"{i}. 🔴 `{label}` — {reason}")
     lines.append(f"\n✅ Online: **{online}/{len(servers)}**")
+    if not TTS_API_KEY and any(r.get("auth_required") for r in results):
+        lines.append("⚠️ A server requires an API key but `TTS_API_KEY` is not set on the bot.")
     await safe_edit(msg, "\n".join(lines))
 
 
@@ -2022,12 +2150,15 @@ async def _handle_admin_state(client: Client, message: Message, state: str, text
         lines = []
         async with aiohttp.ClientSession() as session:
             for url in urls:
-                info = await check_server(session, url)
+                info = await check_server(session, url, deep=True)
                 if not info["ok"]:
-                    lines.append(f"🔴 `{url}` — unreachable, not added")
+                    reason = html.escape(info.get("error") or "unreachable")[:200]
+                    lines.append(f"🔴 `{url}` — not added: {reason}")
                     continue
                 if db.add_server(url):
-                    lines.append(f"🟢 `{url}` — added" + (f" (v{info['version']})" if info["version"] else ""))
+                    auth = " · 🔐 API key OK" if info.get("auth_required") else " · 🔓 no API key"
+                    lines.append(f"🟢 `{url}` — added" + (f" (v{info['version']})" if info["version"] else "")
+                                 + auth + " · test synthesis OK")
                 else:
                     lines.append(f"🟡 `{url}` — already exists")
         admin_states.pop(uid, None)
@@ -2389,13 +2520,33 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: str
                 raise ValueError("Access expired while waiting in the queue")
             job.started = time.time()
             servers = backend_urls(db.servers())
-            pool = ServerPool(servers)
-            conn = aiohttp.TCPConnector(limit=pool.concurrency() + 5)
+            conn = aiohttp.TCPConnector(limit=MAX_TOTAL_CONCURRENCY + 5)
             async with aiohttp.ClientSession(connector=conn) as session:
                 await safe_edit(status, "Checking TTS engines and planning audio...", cancel_markup)
                 remote = [u for u in servers if u != LOCAL_TTS_URL]
-                probes = await asyncio.gather(*(check_server(session, url) for url in remote))
-                limits = [r["max_text_length"] for r in probes if r.get("max_text_length")]
+                # Deep probe = real authenticated /tts call.  A server whose API key does not
+                # match (HTTP 401) or that cannot synthesise is dropped up front, instead of
+                # every chunk failing later with a vague "failed on all servers" message.
+                probes = await asyncio.gather(*(check_server(session, url, deep=True) for url in remote))
+                usable = []
+                skipped = []
+                for url, info in zip(remote, probes):
+                    db.server_health(url, info["ok"])
+                    if info["ok"]:
+                        usable.append(url)
+                    else:
+                        skipped.append(f"{url} ({info.get('error') or 'offline'})")
+                        log.warning("Render server %s skipped for job %s: %s", url, job_id, info.get("error"))
+                if LOCAL_TTS_ENABLED:
+                    usable.append(LOCAL_TTS_URL)
+                if not usable:
+                    raise ValueError("No working TTS engine. " + "; ".join(skipped)[:400])
+                pool = ServerPool(usable)
+                if skipped:
+                    await safe_edit(status, "Skipping unusable engine(s):\n" +
+                                    "\n".join(f"- {html.escape(s)[:160]}" for s in skipped[:5]) +
+                                    "\n\nPlanning audio...", cancel_markup)
+                limits = [r["max_text_length"] for r in probes if r["ok"] and r.get("max_text_length")]
                 if LOCAL_TTS_ENABLED:
                     limits.append(LOCAL_TTS_CHUNK_SIZE)
                 chunk_limit = min([CHUNK_SIZE] + limits)
@@ -2426,7 +2577,7 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: str
                             if not data:
                                 # Do not silently splice later text over a missing passage.
                                 raise RuntimeError(f"Chunk {done_chunks + 1} failed on all attempted servers. "
-                                                   "Processing stopped to avoid gaps in the audiobook")
+                                                   f"Reason: {pool.failure_summary()}")
                             if part_bytes and (part_ms + dur > max_part_ms or
                                                part_bytes + len(data) > MAX_AUDIO_BYTES - 1024 * 1024):
                                 await upload_part()
@@ -2461,8 +2612,9 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: str
     except Exception as exc:
         outcome = "partial" if delivered else "failed"
         log.exception("Job %s failed", job_id)
-        await safe_edit(status, f"Processing stopped: {html.escape(str(exc))[:250]}\n"
-                                f"{delivered} complete part(s) delivered. No failed passages were silently skipped.")
+        await safe_edit(status, f"Processing stopped: {html.escape(str(exc))[:600]}\n\n"
+                                f"{delivered} complete part(s) delivered. No failed passages were silently skipped.\n"
+                                f"Tip: admins can run /servers to see each engine's status and error.")
     finally:
         if active_jobs.get(uid) is job:
             active_jobs.pop(uid, None)
@@ -2509,9 +2661,15 @@ async def main() -> None:
         started = True
         db.execute("UPDATE jobs SET status = 'interrupted', finished_at = ? WHERE status = 'running'", (now_str(),))
         me = await bot.get_me()
-        log.info("AudioBook Pro v%s started as @%s (owner=%s, servers=%d, local_edge_tts=%s x%d..%d)",
+        log.info("AudioBook Pro v%s started as @%s (owner=%s, servers=%d, local_edge_tts=%s x%d..%d, api_key=%s)",
                  VERSION, me.username, OWNER_ID, len(db.servers()), LOCAL_TTS_ENABLED,
-                 LOCAL_TTS_CONCURRENCY, LOCAL_TTS_MAX_CONCURRENCY)
+                 LOCAL_TTS_CONCURRENCY, LOCAL_TTS_MAX_CONCURRENCY, "set" if TTS_API_KEY else "NOT set")
+        if db.servers() and not TTS_API_KEY:
+            log.warning("Render servers are configured but TTS_API_KEY is empty - "
+                        "servers started with API_KEY will reject every request with HTTP 401.")
+        if not LOCAL_TTS_ENABLED and edge_tts is None:
+            log.warning("edge-tts is not installed - the built-in fallback engine is unavailable "
+                        "(pip install edge-tts).")
         pinger = asyncio.create_task(keep_alive_loop())
         engine = (f"built-in Edge-TTS (free, {LOCAL_TTS_CONCURRENCY}-{LOCAL_TTS_MAX_CONCURRENCY}x parallel)"
                   if LOCAL_TTS_ENABLED else "render servers only")

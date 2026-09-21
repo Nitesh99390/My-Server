@@ -122,6 +122,85 @@ def test_adaptive_limiter_enforces_concurrency():
     assert asyncio.run(run()) == 2
 
 
+def test_pool_records_failure_reasons():
+    pool = bot.ServerPool(["https://a.example", bot.LOCAL_TTS_URL])
+    remote, local = pool.states
+    pool.report(remote, False, error="HTTP 401: API key rejected")
+    pool.report(local, False, error="Edge-TTS returned no audio")
+    summary = pool.failure_summary()
+    assert "https://a.example -> HTTP 401: API key rejected" in summary
+    assert "built-in Edge-TTS -> Edge-TTS returned no audio" in summary
+    # success clears the stored reason
+    pool.report(remote, True, latency=0.5)
+    assert remote.last_error == ""
+    assert "no response" in bot.ServerPool(["https://b.example"]).failure_summary()
+
+
+def test_describe_exc_classifies_edge_failures():
+    import asyncio
+    assert bot._describe_exc(asyncio.TimeoutError()) == "timed out"
+    assert "403" in bot._describe_exc(RuntimeError("Invalid response status: 403"))
+    assert bot._describe_exc(ValueError("bad")).startswith("ValueError: bad")
+    assert bot._describe_exc(None) == "unknown error"
+
+
+def test_describe_http_error_gives_actionable_401_hint():
+    import asyncio
+
+    class FakeResp:
+        def __init__(self, status, body):
+            self.status = status
+            self._body = body
+
+        async def text(self):
+            return self._body
+
+    msg = asyncio.run(bot._describe_http_error(FakeResp(401, '{"error":"Unauthorized: invalid or missing API key"}')))
+    assert msg.startswith("HTTP 401") and "TTS_API_KEY" in msg
+    msg = asyncio.run(bot._describe_http_error(FakeResp(400, '{"error":"Text too long (7000 chars)"}')))
+    assert msg == "HTTP 400: Text too long (7000 chars)"
+    assert "not found" in asyncio.run(bot._describe_http_error(FakeResp(404, "")))
+
+
+def test_check_server_flags_missing_api_key(monkeypatch):
+    """A server that reports auth_required must not be treated as usable without a key."""
+    import asyncio
+    from aiohttp import web
+
+    async def health(_):
+        return web.json_response({"status": "ok", "version": "3.2.0", "auth_required": True,
+                                  "max_text_length": 6000, "active_jobs": 0})
+
+    async def tts(_):
+        return web.json_response({"error": "Unauthorized: invalid or missing API key", "status": 401}, status=401)
+
+    async def run():
+        app = web.Application()
+        app.router.add_get("/health", health)
+        app.router.add_post("/tts", tts)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = runner.addresses[0][1]
+        url = f"http://127.0.0.1:{port}"
+        try:
+            async with bot.aiohttp.ClientSession() as session:
+                monkeypatch.setattr(bot, "TTS_API_KEY", "")
+                no_key = await bot.check_server(session, url)
+                monkeypatch.setattr(bot, "TTS_API_KEY", "wrong")
+                wrong_key = await bot.check_server(session, url, deep=True)
+                shallow = await bot.check_server(session, url)
+        finally:
+            await runner.cleanup()
+        return no_key, wrong_key, shallow
+
+    no_key, wrong_key, shallow = asyncio.run(run())
+    assert not no_key["ok"] and "TTS_API_KEY" in no_key["error"]
+    assert not wrong_key["ok"] and wrong_key["error"].startswith("HTTP 401")
+    assert shallow["ok"] and shallow["version"] == "3.2.0"
+
+
 def test_pool_concurrency_accounts_for_local_engine():
     urls = bot.backend_urls(["https://a.example"])
     pool = bot.ServerPool(urls)

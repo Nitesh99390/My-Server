@@ -84,6 +84,25 @@ in Telegram: **Admin Panel → ➕ Add Server** and paste each render-server URL
 (`TTS_API_KEY` in the bot must equal `API_KEY` on the servers). `/servers` shows
 the built-in engine's current parallel limit and throttle count.
 
+### Troubleshooting: "Chunk 1 failed on all attempted servers"
+
+The bot now tells you *why* (e.g. `HTTP 401: API key rejected - set TTS_API_KEY ...`).
+Most common causes:
+
+| Reason shown | Fix |
+|--------------|-----|
+| `HTTP 401 ... TTS_API_KEY` | The render server was deployed with `API_KEY=...` but the bot's `TTS_API_KEY` is empty or different. Set the same value on both (Render → Environment) and restart the bot. |
+| `HTTP 404: /tts endpoint not found` | The URL is not an `app.py` render server. Remove it. |
+| `HTTP 429 rate limited` | Too many parallel requests for that server; lower `PER_SERVER_CONCURRENCY`. |
+| `timed out` | Free Render instance was asleep or overloaded; the bot retries and falls back to the built-in engine. |
+| `built-in Edge-TTS -> ... 403` | Microsoft throttled the bot host IP; wait a few minutes or add a render server on another IP. |
+| `built-in engine disabled` | `pip install edge-tts` on the bot host, or set `LOCAL_TTS_ENABLED=true`. |
+
+**Add Server** and **/servers** now run a real authenticated test synthesis, so a
+misconfigured server is rejected (with the reason) *before* it can break a job. At
+job start, unusable servers are skipped automatically and the job continues on the
+remaining engines.
+
 ## 3. Usage
 
 - `/start` – menu, `/settings` – voice / rate / pitch / volume / split mode
