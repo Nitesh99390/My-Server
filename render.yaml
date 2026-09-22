@@ -7,7 +7,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements-server.txt
-    startCommand: gunicorn app:app --workers 1 --threads 16 --timeout 300
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 300
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
@@ -15,8 +15,8 @@ services:
       - key: API_KEY
         sync: false
       - key: MAX_CONCURRENCY
-        value: "6"
+        value: "4"
       - key: MIN_START_GAP_MS
-        value: "50"
+        value: "200"
       - key: TRUST_PROXY_HOPS
         value: "1"
