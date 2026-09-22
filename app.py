@@ -32,11 +32,11 @@
    API_KEY            if set, clients must send header  X-API-Key: <key>
                       (or ?api_key=<key>)
    MAX_TEXT_LENGTH    default 6000 characters per request
-   MAX_CONCURRENCY    default 6 simultaneous synth jobs (max 8; higher gets the IP throttled)
-   ATTEMPT_TIMEOUT    default 60 s per Edge-TTS connection attempt
-   QUEUE_TIMEOUT      default 12 s waiting for a free slot before 503 + Retry-After
-   MAX_QUEUE          default 8 requests waiting for a slot (more -> instant 503)
-   MIN_START_GAP_MS   default 50 ms between new Edge-TTS connections (burst protection)
+   MAX_CONCURRENCY    default 4 simultaneous synth jobs (max 8; higher gets the IP throttled)
+   ATTEMPT_TIMEOUT    default 75 s per Edge-TTS connection attempt
+   QUEUE_TIMEOUT      default 45 s waiting for a free slot before 503 + Retry-After
+   MAX_QUEUE          default 16 requests waiting for a slot (more -> instant 503)
+   MIN_START_GAP_MS   default 200 ms between new Edge-TTS connections (burst protection)
    DEFAULT_VOICE      default hi-IN-MadhurNeural
    TTS_RETRIES        default 3
    RATE_LIMIT         requests per minute per IP (default 120, 0 = disabled)
@@ -47,7 +47,7 @@
  Requirements
  ------------
    pip install flask edge-tts gunicorn
-   Run (Render):  gunicorn app:app --workers 1 --threads 16 --timeout 300
+   Run (Render):  gunicorn app:app --workers 1 --threads 8 --timeout 300
 =============================================================================
 """
 
@@ -81,7 +81,7 @@ except Exception:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-VERSION = "4.1.0"
+VERSION = "4.0.0"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -99,14 +99,12 @@ PORT = _env_int("PORT", 10000)
 API_KEY = os.getenv("API_KEY", "").strip()
 MAX_TEXT_LENGTH = max(1, _env_int("MAX_TEXT_LENGTH", 6000))
 # Microsoft's free endpoint throttles a single IP that opens too many streams at
-# once (403 / dropped websockets).  6 parallel streams per IP is the highest
-# level that stays reliably clean in practice; the bot's adaptive limiter still
-# steps down on any push-back, so we run close to that ceiling by default.
-MAX_CONCURRENCY = max(1, min(_env_int("MAX_CONCURRENCY", 6), 8))
-MIN_START_GAP = max(0, _env_int("MIN_START_GAP_MS", 50)) / 1000.0
+# once (403 / dropped websockets).  4 parallel streams is a safe, fast default.
+MAX_CONCURRENCY = max(1, min(_env_int("MAX_CONCURRENCY", 4), 8))
+MIN_START_GAP = max(0, _env_int("MIN_START_GAP_MS", 200)) / 1000.0
 DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "hi-IN-MadhurNeural").strip()
 TTS_RETRIES = max(1, _env_int("TTS_RETRIES", 3))
-RATE_LIMIT = _env_int("RATE_LIMIT", 240)
+RATE_LIMIT = _env_int("RATE_LIMIT", 120)
 CACHE_MAX_BYTES = _env_int("CACHE_MAX_MB", 64) * 1024 * 1024
 ENABLE_CORS = _env_bool("ENABLE_CORS", True)
 VOICE_CACHE_TTL = 6 * 3600  # seconds
@@ -114,13 +112,12 @@ SYNTH_TIMEOUT = max(5, _env_int("SYNTH_TIMEOUT", 240))  # whole request, includi
 # Per-attempt budget for one Edge-TTS connection.  Previously this was
 # SYNTH_TIMEOUT / TTS_RETRIES *including* queue wait, so under load every attempt
 # timed out and the client saw "502 NoAudioReceived" even though the IP was fine.
-ATTEMPT_TIMEOUT = max(10, _env_int("ATTEMPT_TIMEOUT", 60))
+ATTEMPT_TIMEOUT = max(10, _env_int("ATTEMPT_TIMEOUT", 75))
 # How long a request may wait for a free synthesis slot before we answer
-# 503 + Retry-After (so the bot immediately moves to another server).  Short:
-# a bot slot parked in our queue is a slot not synthesising anywhere.
-QUEUE_TIMEOUT = max(1, _env_int("QUEUE_TIMEOUT", 12))
+# 503 + Retry-After (so the bot immediately moves to another server).
+QUEUE_TIMEOUT = max(1, _env_int("QUEUE_TIMEOUT", 45))
 # Requests waiting for a slot beyond this number are rejected instantly with 503.
-MAX_QUEUE = max(0, _env_int("MAX_QUEUE", 8))
+MAX_QUEUE = max(0, _env_int("MAX_QUEUE", 16))
 TRUST_PROXY_HOPS = max(0, _env_int("TRUST_PROXY_HOPS", 0))
 
 logging.basicConfig(
@@ -189,18 +186,16 @@ class AsyncRunner:
                 await asyncio.sleep(wait)
             self.last_start = time.monotonic()
 
-    def note_throttle(self, hard: bool = False) -> float:
-        """Record push-back.  Hard (403/429) pauses new connections noticeably,
-        a soft signal (dropped socket / empty audio) only briefly."""
+    def note_throttle(self) -> float:
         self.throttle_events += 1
         self.last_throttle_at = time.monotonic()
-        pause = min(15.0, 1.5 * self.throttle_events) if hard else min(4.0, 0.5 * self.throttle_events)
+        pause = min(20.0, 1.5 * self.throttle_events)
         self.cooldown_until = max(self.cooldown_until, time.monotonic() + pause)
         return pause
 
     def note_success(self) -> None:
-        if self.throttle_events and time.monotonic() > self.cooldown_until + 30:
-            self.throttle_events = max(0, self.throttle_events - 1)
+        if self.throttle_events and time.monotonic() > self.cooldown_until + 60:
+            self.throttle_events = 0
 
     @property
     def throttled(self) -> bool:
@@ -450,16 +445,11 @@ async def _synthesize_once(text: str, voice: str, rate: str, pitch: str, volume:
     return bytes(audio), duration_ms, words
 
 
-def _hard_throttled(exc: BaseException) -> bool:
-    """Microsoft explicitly refused the connection (403/429 / handshake rejected)."""
+def _looks_throttled(exc: BaseException) -> bool:
     text = str(exc).lower()
     return ("403" in text or "429" in text or "too many" in text or "throttl" in text
-            or type(exc).__name__ in {"WSServerHandshakeError", "ClientResponseError"})
-
-
-def _looks_throttled(exc: BaseException) -> bool:
-    return _hard_throttled(exc) or type(exc).__name__ in {
-        "WebSocketError", "NoAudioReceived", "ServerDisconnectedError", "ClientConnectorError"}
+            or type(exc).__name__ in {"WSServerHandshakeError", "ClientResponseError", "WebSocketError",
+                                      "NoAudioReceived", "ServerDisconnectedError", "ClientConnectorError"})
 
 
 class ServiceBusy(RuntimeError):
@@ -516,15 +506,14 @@ async def synthesize(text: str, voice: str, rate: str, pitch: str, volume: str,
             raise
         except Exception as exc:  # noqa: BLE001
             last_err = exc
-            pause = runner.note_throttle(hard=_hard_throttled(exc)) if _looks_throttled(exc) else 0.0
+            pause = runner.note_throttle() if _looks_throttled(exc) else 0.0
             log.warning("Synthesis attempt %d/%d failed (%s): %s",
                         attempt, TTS_RETRIES, type(exc).__name__, exc)
         finally:
             runner.semaphore.release()
         if attempt < TTS_RETRIES:
-            # short back-off with jitter; the runner's cool-down already paces
-            # new connections, so only hard throttles wait noticeably
-            await asyncio.sleep(min(20.0, (0.5 * attempt) + pause + random.uniform(0.1, 0.5)))
+            # exponential back-off with jitter; longer when throttled
+            await asyncio.sleep(min(30.0, (1.5 ** attempt) + pause + random.uniform(0.1, 0.8)))
     detail = f"TTS failed after {TTS_RETRIES} attempts: {type(last_err).__name__}: {last_err}"
     if last_err is not None and _looks_throttled(last_err):
         raise Throttled(retry_after=int(min(60, 10 * max(1, runner.throttle_events))), detail=detail)
