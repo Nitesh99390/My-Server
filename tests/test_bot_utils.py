@@ -393,3 +393,48 @@ def test_local_synthesize_splits_big_chunks_and_keeps_order(monkeypatch):
     assert dur == 10 * len(calls)
     # concatenated in plan order regardless of completion order
     assert audio.decode("utf-8").replace(" ", "").replace("\n", "") == text.replace(" ", "")
+
+
+# ---------------------------------------------------------------------------
+# v4.2.1: voice / script compatibility (English voice + Hindi text = silence)
+# ---------------------------------------------------------------------------
+def test_detect_script():
+    assert bot.detect_script("नमस्ते! यह एक नमूना है।") == "hi"
+    assert bot.detect_script("Hello world, this is a test.") == "en"
+    assert bot.detect_script("আমি বাংলায় কথা বলি") == "bn"
+    assert bot.detect_script("தமிழ் மொழி") == "ta"
+    assert bot.detect_script("*** --- *** 123") is None
+    # Dominant script wins on mixed text.
+    assert bot.detect_script("नमस्ते दुनिया, यह हिंदी है। ok") == "hi"
+
+
+def test_voice_can_read():
+    assert bot.voice_can_read("hi-IN-MadhurNeural", "hi")
+    assert bot.voice_can_read("mr-IN-ManoharNeural", "hi")   # Devanagari shared
+    assert not bot.voice_can_read("en-IN-PrabhatNeural", "hi")
+    assert not bot.voice_can_read("en-US-JennyNeural", "bn")
+    assert bot.voice_can_read("en-US-JennyNeural", "en")
+    assert bot.voice_can_read("hi-IN-SwaraNeural", "en")      # Indic voices are bilingual
+    assert bot.voice_can_read("en-US-JennyNeural", None)
+
+
+def test_compatible_voice_switches_language_keeps_gender():
+    hindi = "नमस्ते! यह आपकी चुनी हुई आवाज़ का एक नमूना है।"
+    assert bot.compatible_voice("en-IN-PrabhatNeural", hindi) == ("hi-IN-MadhurNeural", "hi")
+    assert bot.compatible_voice("en-IN-NeerjaNeural", hindi) == ("hi-IN-SwaraNeural", "hi")
+    assert bot.compatible_voice("en-US-JennyNeural", "আমি বাংলায় কথা বলি") == ("bn-IN-TanishaaNeural", "bn")
+    # Compatible voice is kept untouched.
+    assert bot.compatible_voice("hi-IN-MadhurNeural", hindi) == ("hi-IN-MadhurNeural", "hi")
+    assert bot.compatible_voice("en-IN-PrabhatNeural", "Hello there.") == ("en-IN-PrabhatNeural", "en")
+
+
+def test_is_speakable_and_plan_skips_separator_chunks():
+    assert bot.is_speakable("Hello")
+    assert bot.is_speakable("नमस्ते")
+    assert not bot.is_speakable("*** --- ***")
+    assert not bot.is_speakable("   \n  ")
+    text = "Hello world.\n\n*** --- ***\n\nनमस्ते दुनिया।"
+    plan = bot.build_plan(text, 20, None, False)
+    assert plan
+    assert all(bot.is_speakable(c) for _, c in plan)
+    assert not any(c.strip() == "*** --- ***" for _, c in plan)

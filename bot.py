@@ -132,7 +132,7 @@ except ImportError:  # pragma: no cover
 # =============================================================================
 # Configuration
 # =============================================================================
-VERSION = "4.2.0"
+VERSION = "4.2.1"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -313,6 +313,134 @@ VOICE_GROUPS: Dict[str, List[Tuple[str, str]]] = {
     ],
 }
 VOICE_LABELS: Dict[str, str] = {vid: f"{lbl} [{grp}]" for grp, items in VOICE_GROUPS.items() for lbl, vid in items}
+
+# ---------------------------------------------------------------------------
+# Script <-> voice compatibility
+#
+# Microsoft's *English* voices (en-IN-Prabhat, en-US-Jenny, ...) return an
+# EMPTY audio stream for Devanagari / Bengali / Tamil ... text.  edge-tts
+# surfaces that as ``NoAudioReceived`` - the very same error you get when the
+# IP is throttled - so a Hindi book sent with an English voice used to look
+# like "every engine is throttled": 0/101 chunks, retries, pauses, forever.
+# We therefore detect the dominant script of the text and, when the selected
+# voice cannot pronounce it, switch to a voice of the right language (keeping
+# the gender when possible) and tell the user.
+# ---------------------------------------------------------------------------
+# (language, unicode block start, unicode block end)
+_SCRIPT_BLOCKS: List[Tuple[str, int, int]] = [
+    ("hi", 0x0900, 0x097F),  # Devanagari  (Hindi / Marathi / Nepali)
+    ("bn", 0x0980, 0x09FF),  # Bengali
+    ("pa", 0x0A00, 0x0A7F),  # Gurmukhi (Punjabi)
+    ("gu", 0x0A80, 0x0AFF),  # Gujarati
+    ("or", 0x0B00, 0x0B7F),  # Odia
+    ("ta", 0x0B80, 0x0BFF),  # Tamil
+    ("te", 0x0C00, 0x0C7F),  # Telugu
+    ("kn", 0x0C80, 0x0CFF),  # Kannada
+    ("ml", 0x0D00, 0x0D7F),  # Malayalam
+    ("ur", 0x0600, 0x06FF),  # Arabic script (Urdu)
+    ("ur", 0x0750, 0x077F),  # Arabic supplement
+]
+# Voices that can read a given script.  Indian-language neural voices are
+# bilingual (they read Latin/English text fine), English voices are not.
+_SCRIPT_VOICE_LANGS: Dict[str, Tuple[str, ...]] = {
+    "hi": ("hi", "mr", "ne"),  # every Devanagari voice can read Devanagari
+    "bn": ("bn",),
+    "gu": ("gu",),
+    "ta": ("ta",),
+    "te": ("te",),
+    "kn": ("kn",),
+    "ml": ("ml",),
+    "ur": ("ur",),
+    "pa": ("hi", "mr", "ne"),  # no Punjabi Edge voice - nearest is Hindi
+    "or": ("hi", "mr", "ne"),  # no Odia Edge voice - nearest is Hindi
+}
+# (male, female) fallback voice per script language
+_SCRIPT_FALLBACK_VOICES: Dict[str, Tuple[str, str]] = {
+    "hi": ("hi-IN-MadhurNeural", "hi-IN-SwaraNeural"),
+    "bn": ("bn-IN-BashkarNeural", "bn-IN-TanishaaNeural"),
+    "gu": ("gu-IN-NiranjanNeural", "gu-IN-DhwaniNeural"),
+    "ta": ("ta-IN-ValluvarNeural", "ta-IN-PallaviNeural"),
+    "te": ("te-IN-MohanNeural", "te-IN-ShrutiNeural"),
+    "kn": ("kn-IN-GaganNeural", "kn-IN-SapnaNeural"),
+    "ml": ("ml-IN-MidhunNeural", "ml-IN-SobhanaNeural"),
+    "ur": ("ur-IN-SalmanNeural", "ur-IN-GulNeural"),
+    "pa": ("hi-IN-MadhurNeural", "hi-IN-SwaraNeural"),
+    "or": ("hi-IN-MadhurNeural", "hi-IN-SwaraNeural"),
+}
+_SCRIPT_NAMES = {"hi": "Devanagari (Hindi)", "bn": "Bengali", "gu": "Gujarati", "ta": "Tamil", "te": "Telugu",
+                 "kn": "Kannada", "ml": "Malayalam", "ur": "Urdu", "pa": "Punjabi (Gurmukhi)", "or": "Odia",
+                 "en": "Latin (English)"}
+SCRIPT_SAMPLE_CHARS = 20_000
+_WORD_CHAR_RE = re.compile(r"\w", re.UNICODE)
+
+
+def detect_script(text: str, sample: int = SCRIPT_SAMPLE_CHARS) -> Optional[str]:
+    """Return the dominant script language of ``text`` ("hi", "bn", "en", ...).
+
+    Only letters count (digits / punctuation are script-neutral).  Returns
+    ``None`` when the text has no letters at all (nothing to pronounce).
+    """
+    counts: Dict[str, int] = {}
+    for ch in text[:sample]:
+        if not ch.isalpha():
+            continue
+        o = ord(ch)
+        if o < 0x0250:  # Basic Latin + Latin-1 + Latin Extended
+            counts["en"] = counts.get("en", 0) + 1
+            continue
+        for lang, lo, hi in _SCRIPT_BLOCKS:
+            if lo <= o <= hi:
+                counts[lang] = counts.get(lang, 0) + 1
+                break
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
+def voice_language(voice: str) -> str:
+    return voice.split("-", 1)[0].lower() if voice else ""
+
+
+def voice_is_female(voice: str) -> bool:
+    label = VOICE_LABELS.get(voice, "")
+    return "Female" in label or "(F)" in label
+
+
+def voice_can_read(voice: str, script: Optional[str]) -> bool:
+    """True when ``voice`` is able to pronounce text written in ``script``."""
+    if script is None or script == "en":
+        return True  # every neural voice reads Latin text (accented, but it speaks)
+    allowed = _SCRIPT_VOICE_LANGS.get(script)
+    if allowed is None:
+        return True  # unknown script - let the engine try
+    return voice_language(voice) in allowed
+
+
+def compatible_voice(voice: str, text: str) -> Tuple[str, Optional[str]]:
+    """Return ``(voice_to_use, detected_script)`` for ``text``.
+
+    The selected voice is kept whenever it can read the text; otherwise a
+    voice of the matching language (same gender when known) is returned.
+    """
+    script = detect_script(text)
+    if voice_can_read(voice, script):
+        return voice, script
+    male, female = _SCRIPT_FALLBACK_VOICES.get(script or "", ("", ""))
+    fallback = female if voice_is_female(voice) else male
+    return (fallback or voice), script
+
+
+def script_name(script: Optional[str]) -> str:
+    return _SCRIPT_NAMES.get(script or "", script or "unknown")
+
+
+def is_speakable(text: str) -> bool:
+    """False for chunks made only of symbols / punctuation (``*** --- ***``).
+
+    Edge-TTS answers those with an empty stream (``NoAudioReceived``); they
+    must be skipped, not retried as if the endpoint were throttled.
+    """
+    return bool(_WORD_CHAR_RE.search(text))
 
 RATE_OPTIONS = [("Slow -25%", "-25%"), ("Slightly slow -10%", "-10%"), ("Normal +0%", "+0%"),
                 ("Slightly fast +10%", "+10%"), ("Fast +25%", "+25%"), ("Very fast +50%", "+50%")]
@@ -985,7 +1113,11 @@ def build_plan(text: str, chunk_limit: int, max_bytes: Optional[int], chapter_mo
     for label, body in sections:
         for piece in iter_text_slices(body):
             for chunk in split_text_for_tts(piece, chunk_limit, max_bytes):
-                plan.append((label, chunk))
+                # Separator lines such as "*** --- ***" have nothing to say;
+                # Edge-TTS returns an empty stream for them (NoAudioReceived),
+                # which would otherwise be retried forever as a "throttle".
+                if is_speakable(chunk):
+                    plan.append((label, chunk))
     return plan
 
 
@@ -1536,6 +1668,9 @@ def _describe_exc(exc: Optional[BaseException]) -> str:
         return "timed out"
     if "403" in text or name == "WSServerHandshakeError":
         return f"{name}: Microsoft Edge endpoint refused the connection (HTTP 403 - IP throttled / blocked)"
+    if name == "NoAudioReceived" or isinstance(exc, ThrottleError) and "no audio" in text:
+        return (f"{name}: Edge-TTS returned an empty stream (voice cannot pronounce this text, "
+                f"or the IP is throttled)")
     return f"{name}: {text[:120]}" if text else name
 
 
@@ -1555,6 +1690,19 @@ async def local_synthesize(text: str, settings: Dict[str, Any], cancel: asyncio.
     global local_last_error
     if not LOCAL_TTS_ENABLED:
         local_last_error = "built-in engine disabled (edge-tts not installed or LOCAL_TTS_ENABLED=false)"
+        return None, 0
+    if not is_speakable(text):
+        # Symbols only - Edge returns no audio; nothing to retry.
+        local_last_error = "chunk contains no pronounceable text"
+        return None, 0
+    script = detect_script(text)
+    if not voice_can_read(settings["voice"], script):
+        # An English voice given Devanagari/Bengali/... text: Microsoft answers
+        # with an empty stream every single time.  Retrying would only make the
+        # limiter believe the IP is throttled.
+        local_last_error = (f"voice {settings['voice']} cannot read {script_name(script)} text - "
+                            f"pick a matching voice in Settings")
+        log.error("Edge-TTS: %s", local_last_error)
         return None, 0
     if edge_payload_bytes(text) > LOCAL_TTS_MAX_BYTES:
         pieces = split_text_for_tts(text, LOCAL_TTS_CHUNK_SIZE, LOCAL_TTS_MAX_BYTES)
@@ -1672,6 +1820,12 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
     escalating back-off and re-queues the chunk - text is never dropped and the
     job never gives up by itself.
     """
+    # Per-chunk voice safety: a Hindi passage inside an English book (or vice
+    # versa) is read by a voice that can actually pronounce it, otherwise Edge
+    # returns silence and the chunk would be retried as a "throttle" forever.
+    use_voice, _script = compatible_voice(settings["voice"], chunk)
+    if use_voice != settings["voice"]:
+        settings = {**settings, "voice": use_voice}
     payload = {"text": chunk, "voice": settings["voice"], "rate": settings["rate"],
                "pitch": settings["pitch"], "volume": settings["volume"]}
     rejected = set()
@@ -2344,12 +2498,16 @@ async def send_voice_preview(client: Client, chat_id: int, uid: int, reply_to: O
     if not servers:
         await safe_send(client, chat_id, "❌ No TTS engine available. Ask the administrator.")
         return
-    sample = ("Hello! This is a preview of your selected voice. "
-              "नमस्ते! यह आपकी चुनी हुई आवाज़ का एक नमूना है।")
-    if settings["voice"].startswith("en-"):
+    # English voices cannot pronounce Indic scripts (Edge returns silence), so
+    # the mixed sample is only used for voices that read both.
+    lang = voice_language(settings["voice"])
+    if lang == "en":
         sample = "Hello! This is a preview of your selected voice. Your audiobook will sound like this."
-    elif settings["voice"].startswith("hi-"):
+    elif lang in ("hi", "mr", "ne"):
         sample = "नमस्ते! यह आपकी चुनी हुई आवाज़ का एक नमूना है। आपकी ऑडियोबुक इसी आवाज़ में बनेगी।"
+    else:
+        # Bengali / Tamil / ... voices are bilingual with English.
+        sample = "Hello! This is a preview of your selected voice. Your audiobook will sound like this."
     pool = ServerPool(servers)
     async with aiohttp.ClientSession() as session:
         _, data, dur = await fetch_chunk(session, pool, sample, 0, settings, asyncio.Semaphore(1), asyncio.Event())
@@ -3289,6 +3447,27 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: Opt
 
                     plan, nchars = await asyncio.to_thread(_plan)
                     db.execute("UPDATE jobs SET chars = ? WHERE id = ?", (nchars, job_id))
+                    # ----------------------------------------------------------
+                    # Voice / script compatibility.  An English voice cannot
+                    # pronounce Devanagari (or any Indic script): Microsoft
+                    # returns an EMPTY stream, which looks exactly like IP
+                    # throttling (NoAudioReceived).  Detect it up front, switch to
+                    # a voice of the right language and tell the user - instead
+                    # of retrying 0/101 chunks forever.
+                    # ----------------------------------------------------------
+                    sample_text = "\n".join(c for _, c in plan[:50])
+                    new_voice, script = compatible_voice(settings["voice"], sample_text)
+                    if new_voice != settings["voice"]:
+                        old_voice = settings["voice"]
+                        settings = {**settings, "voice": new_voice}
+                        voice_note = (f"⚠️ **Voice changed for this book**\n"
+                                      f"`{old_voice}` is an English voice and cannot read "
+                                      f"{script_name(script)} text (Microsoft returns silence).\n"
+                                      f"Using `{new_voice}` ({voice_label(new_voice)}) instead.\n"
+                                      f"Change the default in ⚙️ Settings → Voice if you prefer another one.")
+                        log.warning("Job %s: voice %s cannot read %s text -> using %s",
+                                    job_id, old_voice, script_name(script), new_voice)
+                        await safe_send(client, status.chat.id, voice_note)
                     db.job_init_resume(job_id, title, status.chat.id, status.id, settings, len(plan))
                 total_chunks = len(plan)
                 if not total_chunks:
