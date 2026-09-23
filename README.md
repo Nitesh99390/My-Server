@@ -9,7 +9,31 @@ neural voices** (`edge-tts`) — no API key, no paid TTS service.
 | `bot.py` | Telegram bot (Pyrogram/MTProto, uploads up to 2 GB). **Built-in free Edge-TTS engine**, chunking, chapter splitting, optional multi-server load balancing, progress bar, user approval system, admin panel. |
 | `app.py` | *Optional* Flask micro-service wrapping `edge-tts` for extra render capacity on other IPs. `/tts`, `/tts/stream`, `/tts/subtitles`, `/voices`, `/health`, `/stats`. |
 
-Version: **bot 4.1.1 / server 4.0.0**
+Version: **bot 4.2.1 / server 4.1.1**
+
+---
+
+## 🩹 v4.2.1: "0/101 chunks … NoAudioReceived on every engine" fixed
+
+The screenshot symptom: `Current voice: en-IN-PrabhatNeural`, a Hindi book, and the
+progress bar stuck at **0 %** while every render server logged
+`Synthesis attempt 1/3 failed (NoAudioReceived)`.
+
+**Root cause** — Microsoft's *English* neural voices return an **empty audio stream**
+for Devanagari / Bengali / Tamil … text. `edge-tts` raises `NoAudioReceived`, which is
+the very same error you get when an IP is throttled, so the bot treated a wrong-voice
+book as "all engines throttled": retry → halve limiter → pause → retry … forever.
+
+| Fix | Where |
+|-----|-------|
+| **Script detection** (`detect_script`) of the book text: Devanagari, Bengali, Gurmukhi, Gujarati, Odia, Tamil, Telugu, Kannada, Malayalam, Urdu, Latin. | `bot.py`, `app.py` |
+| If the selected voice **cannot read** that script the job **switches to a voice of the right language, same gender** (`en-IN-Prabhat` → `hi-IN-Madhur`, `en-IN-Neerja` → `hi-IN-Swara`, …) and tells the user once. Per-chunk check too, so a Hindi passage inside an English book still gets spoken. | `bot.py` |
+| Separator-only chunks (`*** --- ***`) are **dropped from the plan** — Edge returns no audio for them and they were retried as throttles. | `bot.py` |
+| Built-in engine refuses an unreadable voice/text pair immediately with a clear error instead of burning retries and limiter capacity. | `bot.py` |
+| Render server returns **HTTP 400** (`Voice 'en-IN-PrabhatNeural' cannot pronounce Devanagari (Hindi) text`) instead of 502 after 3 futile attempts, so the bot fails over instantly and the server is **not** marked throttled. | `app.py` |
+| Voice-preview sample no longer sends Hindi text to English voices. | `bot.py` |
+
+> Redeploy both `bot.py` and every `app.py` render server.
 
 ---
 

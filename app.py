@@ -81,7 +81,7 @@ except Exception:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-VERSION = "4.1.0"
+VERSION = "4.1.1"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -634,6 +634,52 @@ def _payload() -> Optional[dict]:
     return request.args.to_dict()
 
 
+# Indic unicode blocks -> language code.  English neural voices return an EMPTY
+# stream for these scripts (edge-tts raises NoAudioReceived), which is
+# indistinguishable from IP throttling - so we reject such requests with a
+# clear 400 instead of retrying and back-off'ing as if Microsoft had blocked us.
+_SCRIPT_BLOCKS: List[Tuple[str, int, int]] = [
+    ("hi", 0x0900, 0x097F), ("bn", 0x0980, 0x09FF), ("pa", 0x0A00, 0x0A7F), ("gu", 0x0A80, 0x0AFF),
+    ("or", 0x0B00, 0x0B7F), ("ta", 0x0B80, 0x0BFF), ("te", 0x0C00, 0x0C7F), ("kn", 0x0C80, 0x0CFF),
+    ("ml", 0x0D00, 0x0D7F), ("ur", 0x0600, 0x06FF), ("ur", 0x0750, 0x077F),
+]
+_SCRIPT_VOICE_LANGS: Dict[str, Tuple[str, ...]] = {
+    "hi": ("hi", "mr", "ne"), "bn": ("bn",), "gu": ("gu",), "ta": ("ta",), "te": ("te",),
+    "kn": ("kn",), "ml": ("ml",), "ur": ("ur",), "pa": ("hi", "mr", "ne"), "or": ("hi", "mr", "ne"),
+}
+_SCRIPT_NAMES = {"hi": "Devanagari (Hindi)", "bn": "Bengali", "gu": "Gujarati", "ta": "Tamil", "te": "Telugu",
+                 "kn": "Kannada", "ml": "Malayalam", "ur": "Urdu", "pa": "Punjabi", "or": "Odia", "en": "Latin"}
+_WORD_CHAR_RE = re.compile(r"\w", re.UNICODE)
+
+
+def detect_script(text: str, sample: int = 20_000) -> Optional[str]:
+    """Dominant script language of ``text`` ("hi", "en", ...); None if no letters."""
+    counts: Dict[str, int] = {}
+    for ch in text[:sample]:
+        if not ch.isalpha():
+            continue
+        o = ord(ch)
+        if o < 0x0250:
+            counts["en"] = counts.get("en", 0) + 1
+            continue
+        for lang, lo, hi in _SCRIPT_BLOCKS:
+            if lo <= o <= hi:
+                counts[lang] = counts.get(lang, 0) + 1
+                break
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
+def voice_can_read(voice: str, script: Optional[str]) -> bool:
+    if script is None or script == "en":
+        return True
+    allowed = _SCRIPT_VOICE_LANGS.get(script)
+    if allowed is None:
+        return True
+    return voice.split("-", 1)[0].lower() in allowed
+
+
 def _validate(params: dict):
     """Return (clean_params, error_message)."""
     if not isinstance(params.get("text"), str):
@@ -643,6 +689,8 @@ def _validate(params: dict):
         return None, "Field 'text' is required and cannot be empty"
     if len(text) > MAX_TEXT_LENGTH:
         return None, f"Text too long ({len(text)} chars). Maximum is {MAX_TEXT_LENGTH}"
+    if not _WORD_CHAR_RE.search(text):
+        return None, "Text contains no pronounceable characters (symbols/punctuation only)"
 
     voice = str(params.get("voice") or DEFAULT_VOICE).strip()
     rate = str(params.get("rate") or "+0%").strip().replace(" ", "")
@@ -662,6 +710,10 @@ def _validate(params: dict):
     exists = voice_exists(voice)
     if exists is False:
         return None, f"Unknown voice: {voice!r}. Use GET /voices to list available voices"
+    script = detect_script(text)
+    if not voice_can_read(voice, script):
+        return None, (f"Voice {voice!r} cannot pronounce {_SCRIPT_NAMES.get(script, script)} text "
+                      f"(Edge-TTS returns silence). Use a matching voice, e.g. hi-IN-MadhurNeural")
     if not RATE_RE.fullmatch(rate) or not -99 <= int(rate[:-1]) <= 200:
         return None, f"Invalid rate: {rate!r} (example: +20% or -10%)"
     if not PITCH_RE.fullmatch(pitch) or not -100 <= int(pitch[:-2]) <= 100:
