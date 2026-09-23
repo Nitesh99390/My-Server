@@ -32,11 +32,11 @@
    API_KEY            if set, clients must send header  X-API-Key: <key>
                       (or ?api_key=<key>)
    MAX_TEXT_LENGTH    default 6000 characters per request
-   MAX_CONCURRENCY    default 4 simultaneous synth jobs (max 8; higher gets the IP throttled)
+   MAX_CONCURRENCY    default 6 simultaneous synth jobs (max 8; higher gets the IP throttled)
    ATTEMPT_TIMEOUT    default 75 s per Edge-TTS connection attempt
    QUEUE_TIMEOUT      default 45 s waiting for a free slot before 503 + Retry-After
    MAX_QUEUE          default 16 requests waiting for a slot (more -> instant 503)
-   MIN_START_GAP_MS   default 200 ms between new Edge-TTS connections (burst protection)
+   MIN_START_GAP_MS   default 80 ms between new Edge-TTS connections (burst protection)
    DEFAULT_VOICE      default hi-IN-MadhurNeural
    TTS_RETRIES        default 3
    RATE_LIMIT         requests per minute per IP (default 120, 0 = disabled)
@@ -81,7 +81,7 @@ except Exception:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -99,9 +99,13 @@ PORT = _env_int("PORT", 10000)
 API_KEY = os.getenv("API_KEY", "").strip()
 MAX_TEXT_LENGTH = max(1, _env_int("MAX_TEXT_LENGTH", 6000))
 # Microsoft's free endpoint throttles a single IP that opens too many streams at
-# once (403 / dropped websockets).  4 parallel streams is a safe, fast default.
-MAX_CONCURRENCY = max(1, min(_env_int("MAX_CONCURRENCY", 4), 8))
-MIN_START_GAP = max(0, _env_int("MIN_START_GAP_MS", 200)) / 1000.0
+# once (403 / dropped websockets).  6 parallel streams per IP is the highest
+# level that stays reliably free of 403s in practice; the pacer below still
+# backs off automatically the moment Microsoft pushes back.
+MAX_CONCURRENCY = max(1, min(_env_int("MAX_CONCURRENCY", 6), 8))
+# Spacing between new Edge-TTS connections.  80 ms is enough to avoid a burst
+# while still letting all slots refill within half a second.
+MIN_START_GAP = max(0, _env_int("MIN_START_GAP_MS", 80)) / 1000.0
 DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "hi-IN-MadhurNeural").strip()
 TTS_RETRIES = max(1, _env_int("TTS_RETRIES", 3))
 RATE_LIMIT = _env_int("RATE_LIMIT", 120)
@@ -748,7 +752,9 @@ def health():
         max_text_length=MAX_TEXT_LENGTH,
         max_concurrency=MAX_CONCURRENCY,
         active_jobs=runner.active,
+        free_slots=max(0, MAX_CONCURRENCY - runner.active),
         queued=getattr(runner, "waiting", 0),
+        min_start_gap_ms=int(MIN_START_GAP * 1000),
         throttled=bool(getattr(runner, "throttled", False)),
         throttle_events=getattr(runner, "throttle_events", 0),
         auth_required=bool(API_KEY),

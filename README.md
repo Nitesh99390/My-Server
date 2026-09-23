@@ -13,6 +13,22 @@ Version: **bot 4.1.1 / server 4.0.0**
 
 ---
 
+## 🚀 v4.2: 2–3× faster multi-server generation
+
+| Bottleneck found in v4.1 | v4.2 fix |
+|--------------------------|----------|
+| Render servers got **~1300-char Hindi chunks** (the built-in engine's 3900-byte websocket cap was applied to *every* engine) → 2–3× more HTTP round trips than needed | **Engine-aware chunk plan**: with render servers the plan uses `REMOTE_CHUNK_SIZE` (3000, clamped to each server's `max_text_length`) and no byte cap. The built-in engine still helps out — it splits an oversized chunk into websocket-sized pieces and runs them in parallel itself. |
+| `PER_SERVER_CONCURRENCY=3` default, ramp-up only after 8 clean chunks, 100 ms gap → 4 servers ≈ 9× parallel | Defaults `4 → 8` per server, `REMOTE_GROW_AFTER=3`, `REMOTE_MIN_GAP_MS=30`; the ceiling is clamped to the `max_concurrency` a server advertises on `/health` so the bot never over-queues (no more wasted 503 round trips). 4 servers ≈ **24–32× parallel**. |
+| Round-robin scheduling: a slow server received as many chunks as a fast one | **Least-loaded scheduling**: the engine with the most free slots (then lowest latency) gets the next chunk; engines in cooldown are skipped; a failed attempt fails over *immediately* when another engine is free instead of sleeping in the slot. |
+| `503 server busy` was treated like Microsoft throttling (limiter halved + long cooldown) | Busy = "we sent one request too many": trim by one, try elsewhere after 1 s; the IP is **not** marked throttled. |
+| Finishing a part (ffmpeg remux + Telegram upload of up to hundreds of MB) ran **inline** and froze synthesis for minutes | **Background uploader** (single ordered worker task): generation keeps every engine busy while the previous part uploads. |
+| Progress showed only chunk counts | Progress shows **chars/s, × realtime, requests in flight / limit** and a char-based ETA (chunks differ a lot in size). |
+| `app.py`: `MAX_CONCURRENCY=4`, `MIN_START_GAP_MS=200`, 8 gunicorn threads | `MAX_CONCURRENCY=6`, `MIN_START_GAP_MS=80`, 24 threads; `/health` adds `free_slots`. |
+
+> **Deploy both sides**: redeploy every render server (`app.py`) *and* the bot. Old servers keep working (the bot reads whatever they advertise) but at their old 4-slot ceiling.
+
+---
+
 ## ⭐ v4: any file size, any number of servers, never gives up
 
 | Problem in v3 | v4 behaviour |
@@ -65,7 +81,7 @@ fallback.
 Deploy one or more copies (Render free tier works). The bot load-balances across all of them.
 
 **Render:** push this repo → *New Web Service* → Build `pip install -r requirements-server.txt`
-→ Start `gunicorn app:app --workers 1 --threads 8 --timeout 300`.
+→ Start `gunicorn app:app --workers 1 --threads 24 --timeout 300`.
 Or use the included `render.yaml` blueprint.
 
 **Docker:**
@@ -74,8 +90,12 @@ docker build -f Dockerfile.server -t tts-server .
 docker run -p 10000:10000 -e API_KEY=mysecret tts-server
 ```
 
-Key env vars: `PORT`, `API_KEY`, `MAX_TEXT_LENGTH=6000`, `MAX_CONCURRENCY=4` (keep ≤ 6 per IP),
-`MIN_START_GAP_MS=200`, `RATE_LIMIT=120`, `CACHE_MAX_MB=64`, `TRUST_PROXY_HOPS=1` (behind Render/Cloudflare).
+Key env vars: `PORT`, `API_KEY`, `MAX_TEXT_LENGTH=6000`, `MAX_CONCURRENCY=6` (keep ≤ 6 per IP),
+`MIN_START_GAP_MS=80`, `RATE_LIMIT=120`, `CACHE_MAX_MB=64`, `TRUST_PROXY_HOPS=1` (behind Render/Cloudflare).
+
+Bot-side knobs for render servers: `PER_SERVER_CONCURRENCY=4` (start), `PER_SERVER_MAX_CONCURRENCY=8`
+(ceiling, auto-clamped to the server's `/health` `max_concurrency`), `REMOTE_CHUNK_SIZE=3000`,
+`REMOTE_MIN_GAP_MS=30`, `REMOTE_GROW_AFTER=3`, `PIPELINE_WINDOW_EXTRA=8`.
 
 Quick test:
 ```bash

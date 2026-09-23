@@ -269,3 +269,127 @@ def test_read_text_file_encodings(tmp_path):
         p = tmp_path / f"{name}.txt"
         p.write_bytes(raw)
         assert bot.clean_text(bot._read_text_file(str(p)))
+
+
+# --------------------------------------------------------------------------
+# v4.2 speed work: engine-aware chunk plan, least-loaded scheduling,
+# server-advertised concurrency, background uploads
+# --------------------------------------------------------------------------
+def test_plan_limits_uses_big_chunks_for_render_servers():
+    # With render servers the plan must NOT be squeezed to the built-in
+    # engine's ~3900-byte websocket cap (=> ~1300 Hindi chars per request).
+    probes = [{"ok": True, "max_text_length": 6000}, {"ok": True, "max_text_length": 6000}]
+    limit, max_bytes = bot.plan_limits(probes)
+    assert limit == min(6000, bot.REMOTE_CHUNK_SIZE) and max_bytes is None
+    # smallest advertised limit wins
+    limit, _ = bot.plan_limits([{"ok": True, "max_text_length": 6000}, {"ok": True, "max_text_length": 2500}])
+    assert limit == 2500
+    # old servers without max_text_length -> CHUNK_SIZE, still no byte cap
+    assert bot.plan_limits([{"ok": True}]) == (bot.CHUNK_SIZE, None)
+    # built-in engine only -> byte-aware plan (1 chunk = 1 websocket)
+    limit, max_bytes = bot.plan_limits([])
+    assert max_bytes == bot.LOCAL_TTS_MAX_BYTES and limit <= bot.LOCAL_TTS_CHUNK_SIZE
+
+
+def test_render_server_plan_needs_far_fewer_requests_for_hindi():
+    text = ("यह एक बहुत लंबा वाक्य है जिसमें कई शब्द हैं। " * 1500).strip()  # ~60k chars
+    old_plan = bot.build_plan(text, 3000, bot.LOCAL_TTS_MAX_BYTES, False)
+    limit, max_bytes = bot.plan_limits([{"ok": True, "max_text_length": 6000}])
+    new_plan = bot.build_plan(text, limit, max_bytes, False)
+    assert len(new_plan) * 2 <= len(old_plan)
+    assert all(len(c) <= 6000 for _, c in new_plan)
+    assert "".join(c for _, c in new_plan).replace(" ", "").replace("\n", "") == text.replace(" ", "")
+
+
+def test_pool_pick_prefers_engine_with_most_free_slots():
+    a, b = "https://fast.example", "https://slow.example"
+    pool = bot.ServerPool([a, b])
+    la, lb = bot.remote_limiter(a), bot.remote_limiter(b)
+    la.current = lb.current = 4
+    la._active, lb._active = 1, 4  # b is saturated
+    for _ in range(6):
+        assert pool.pick().url == a
+    la._active, lb._active = 3, 3
+    sa, sb = pool.states
+    sa.latency, sb.latency = 2.0, 0.5  # equal load -> lower latency wins
+    assert pool.pick().url == b
+    la._active = lb._active = 0
+    # engines in cooldown are skipped while another one is live
+    sb.cooldown_until = bot.time.time() + 60
+    assert pool.pick().url == a
+
+
+def test_pool_pick_shares_load_between_equal_engines():
+    urls = [f"https://s{i}.example" for i in range(3)]
+    pool = bot.ServerPool(urls)
+    for u in urls:
+        lim = bot.remote_limiter(u)
+        lim.current, lim._active = 4, 0
+    picked = {pool.pick().url for _ in range(3)}
+    assert picked == set(urls)  # round-robin tie-break, not always the first
+
+
+def test_apply_probe_clamps_limiter_to_server_capacity():
+    url = "https://small.example"
+    pool = bot.ServerPool([url])
+    lim = bot.remote_limiter(url)
+    assert lim.maximum == bot.PER_SERVER_MAX_CONCURRENCY
+    pool.apply_probe(url, {"ok": True, "max_concurrency": 4})
+    assert lim.maximum == 4 and lim.current <= 4
+    assert pool.states[0].advertised_limit == 4
+    pool.apply_probe(url, {"ok": True, "max_concurrency": 6})
+    assert lim.maximum == 6
+    # never above the hard per-IP ceiling of 8
+    pool.apply_probe(url, {"ok": True, "max_concurrency": 64})
+    assert lim.maximum == 8
+    # garbage is ignored
+    pool.apply_probe(url, {"ok": True, "max_concurrency": "many"})
+    assert lim.maximum == 8
+
+
+def test_remote_limiter_ramps_faster_than_local():
+    lim = bot.remote_limiter("https://ramp.example")
+    assert lim.grow_after == bot.REMOTE_GROW_AFTER < bot.LOCAL_TTS_GROW_AFTER
+    assert lim.min_gap == bot.REMOTE_MIN_GAP < bot.LOCAL_TTS_MIN_GAP
+    start = lim.current
+    for _ in range(lim.grow_after):
+        lim.report_success()
+    assert lim.current == min(lim.maximum, start + 1)
+
+
+def test_pool_reports_chars_for_throughput():
+    pool = bot.ServerPool(["https://t.example"])
+    s = pool.states[0]
+    pool.report(s, True, latency=1.0, chars=1200)
+    pool.report(s, True, latency=1.0, chars=800)
+    assert s.chars_done == 2000
+    pool.report(s, False, error="boom", chars=500)
+    assert s.chars_done == 2000
+
+
+def test_local_synthesize_splits_big_chunks_and_keeps_order(monkeypatch):
+    import asyncio
+    if not bot.LOCAL_TTS_ENABLED:
+        return
+    calls = []
+
+    async def fake_once(text, settings):
+        calls.append(text)
+        await asyncio.sleep(0.01 if len(calls) % 2 else 0.0)
+        return text.encode("utf-8"), 10
+
+    monkeypatch.setattr(bot, "_local_synth_once", fake_once)
+    monkeypatch.setattr(bot.local_limiter, "min_gap", 0.0)
+    text = ("यह एक बहुत लंबा वाक्य है जिसमें कई शब्द हैं। " * 120).strip()  # ~5.4k chars, ~15 KB
+    assert bot.edge_payload_bytes(text) > bot.LOCAL_TTS_MAX_BYTES
+
+    async def run():
+        return await bot.local_synthesize(text, {"voice": "hi-IN-MadhurNeural", "rate": "+0%",
+                                                 "pitch": "+0Hz", "volume": "+0%"}, asyncio.Event())
+
+    audio, dur = asyncio.run(run())
+    assert len(calls) >= 3  # split into several websocket-sized pieces
+    assert all(bot.edge_payload_bytes(c) <= bot.LOCAL_TTS_MAX_BYTES for c in calls)
+    assert dur == 10 * len(calls)
+    # concatenated in plan order regardless of completion order
+    assert audio.decode("utf-8").replace(" ", "").replace("\n", "") == text.replace(" ", "")
