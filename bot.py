@@ -132,7 +132,7 @@ except ImportError:  # pragma: no cover
 # =============================================================================
 # Configuration
 # =============================================================================
-VERSION = "4.2.1"
+VERSION = "4.3.0"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -172,6 +172,14 @@ REMOTE_MIN_GAP = max(0, _env_int("REMOTE_MIN_GAP_MS", 30)) / 1000.0
 # Characters per HTTP request to a render server (further clamped to the
 # server's advertised max_text_length).  Bigger chunks = far fewer round trips.
 REMOTE_CHUNK_SIZE = max(500, min(_env_int("REMOTE_CHUNK_SIZE", 3000), 6000))
+# --- Even chunk sizes (v4.3) --------------------------------------------------
+# Chunks used to range from a few hundred characters (one short paragraph) to
+# the full limit, which makes progress jumpy and wastes requests.  The planner
+# now packs paragraphs/sentences to a *target* size and only lets a chunk fall
+# below CHUNK_MIN_RATIO of the target at the very end of a chapter.
+# TARGET_CHUNK_CHARS=0 -> target = 90% of the engine limit.
+TARGET_CHUNK_CHARS = max(0, min(_env_int("TARGET_CHUNK_CHARS", 0), 6000))
+CHUNK_MIN_RATIO = max(0.3, min(_env_int("CHUNK_MIN_PERCENT", 60), 95) / 100.0)
 # Clean chunks a render server must deliver before it gets one more parallel
 # slot.  Render servers each sit on their own IP and are fronted by their own
 # limiter, so they can ramp up much faster than the built-in engine.
@@ -218,6 +226,14 @@ JOBS_DIR = _env("JOBS_DIR", os.path.join(os.path.dirname(os.path.abspath(DB_PATH
 JOB_MAX_STALL_MINUTES = max(0, _env_int("JOB_MAX_STALL_MINUTES", 0))
 # Escalating pause (seconds) between rounds when all engines are failing.
 STALL_BACKOFF_STEPS = [5, 10, 20, 30, 60, 90, 120, 180, 300]
+# --- Per-server Microsoft-throttle quarantine (v4.3) -------------------------
+# When ONE render server's IP gets throttled by Microsoft (HTTP 503 with
+# NoAudioReceived / 403) it is benched for QUARANTINE_STEPS[level] seconds while
+# the job keeps running on the other engines.  The level escalates on repeated
+# throttles and drops after QUARANTINE_FORGIVE_AFTER clean chunks.
+_q_steps = [max(15, int(x)) for x in re.findall(r"\d+", _env("QUARANTINE_STEPS", "60,120,300,600"))]
+QUARANTINE_STEPS: List[int] = _q_steps or [60, 120, 300, 600]
+QUARANTINE_FORGIVE_AFTER = max(5, _env_int("QUARANTINE_FORGIVE_AFTER", 25))
 # Resume unfinished jobs automatically after the bot restarts.
 RESUME_ON_START = os.getenv("RESUME_ON_START", "true").strip().lower() in ("1", "true", "yes", "on")
 # Text is streamed through the planner in slices of this many characters so a
@@ -1044,6 +1060,103 @@ def _append_chunk(chunks: List[str], piece: str, max_len: int) -> None:
         chunks.append(piece)
 
 
+_SENTENCE_UNITS = re.compile(r"(?<=[.!?।؟。])\s+|\n+")
+
+
+def even_chunks(text: str, target: int, max_len: int, min_ratio: float = CHUNK_MIN_RATIO,
+                max_bytes: Optional[int] = None) -> List[str]:
+    """Pack ``text`` into chunks of *even* size (v4.3).
+
+    Every chunk is ``<= max_len`` characters (and ``<= max_bytes`` on the wire
+    when given) and, except for the final one, at least ``min_ratio * target``
+    characters.  Sentences are never cut unless a single sentence is longer
+    than ``max_len``.  Compared with the paragraph-based splitter this gives
+    chunks of 0.6x-1.0x the target instead of anything between a one-line
+    paragraph and the hard limit, so requests are equally expensive, the
+    progress bar moves smoothly and no engine is handed a tiny or a huge job.
+    """
+    max_len = max(50, int(max_len))
+    target = max(50, min(int(target), max_len))
+    min_len = max(1, int(target * min_ratio))
+
+    def fits(cur: str, extra: str) -> bool:
+        cand_len = len(cur) + len(extra) + (1 if cur else 0)
+        if cand_len > max_len:
+            return False
+        if max_bytes and edge_payload_bytes(f"{cur} {extra}" if cur else extra) > max_bytes:
+            return False
+        return True
+
+    units: List[str] = []
+    for u in _SENTENCE_UNITS.split(text):
+        u = (u or "").strip()
+        if not u:
+            continue
+        # Hard-split a sentence that alone exceeds the limits.
+        while len(u) > max_len or (max_bytes and edge_payload_bytes(u) > max_bytes):
+            budget = max_len
+            if max_bytes:
+                density = edge_payload_bytes(u) / max(1, len(u))
+                budget = max(20, min(max_len, int(max_bytes / density * 0.95)))
+            cut = u.rfind(" ", budget // 3, budget)
+            cut = cut if cut > 0 else budget
+            units.append(u[:cut].strip())
+            u = u[cut:].strip()
+        if u:
+            units.append(u)
+
+    out: List[str] = []
+    cur = ""
+    for u in units:
+        if not cur:
+            cur = u
+            continue
+        # Close the chunk when it reached the target, or when adding the next
+        # sentence would overflow.
+        if len(cur) >= target or not fits(cur, u):
+            out.append(cur)
+            cur = u
+        else:
+            cur = f"{cur} {u}"
+    if cur:
+        out.append(cur)
+
+    # Re-balance: a trailing runt (< min_len) is merged into the previous chunk
+    # when that stays within the limits, otherwise the last two chunks are
+    # split evenly so neither is tiny.
+    if len(out) >= 2 and len(out[-1]) < min_len:
+        prev, last = out[-2], out[-1]
+        if fits(prev, last):
+            out[-2] = f"{prev} {last}"
+            out.pop()
+        else:
+            merged = f"{prev} {last}"
+            half = len(merged) // 2
+            # Prefer a sentence end near the middle, else the nearest space.
+            window = max_len // 4
+            cut = -1
+            for m in _SENTENCE_UNITS.finditer(merged, max(1, half - window), min(len(merged), half + window)):
+                if cut < 0 or abs(m.start() - half) < abs(cut - half):
+                    cut = m.start()
+            if cut < 0:
+                before = merged.rfind(" ", max(1, half - window), half)
+                after = merged.find(" ", half, half + window)
+                cands = [c for c in (before, after) if c > 0]
+                cut = min(cands, key=lambda c: abs(c - half)) if cands else -1
+            if cut > 0:
+                a, b = merged[:cut].strip(), merged[cut:].strip()
+                if a and b and fits("", a) and fits("", b):
+                    out[-2], out[-1] = a, b
+    return [c for c in out if c.strip()]
+
+
+def chunk_target(chunk_limit: int) -> int:
+    """Target chunk size for a plan given the engine's hard limit."""
+    if TARGET_CHUNK_CHARS:
+        return max(200, min(TARGET_CHUNK_CHARS, chunk_limit))
+    return max(200, int(chunk_limit * 0.9))
+
+
 def edge_payload_bytes(text: str) -> int:
     """Bytes Edge-TTS will put on the wire for ``text`` (XML-escaped UTF-8).
 
@@ -1109,15 +1222,26 @@ def build_plan(text: str, chunk_limit: int, max_bytes: Optional[int], chapter_mo
     multi-million-character book stays memory-flat.
     """
     plan: List[Tuple[str, str]] = []
+    target = chunk_target(chunk_limit)
     sections = split_chapters(text) if chapter_mode else [("Audiobook", text)]
     for label, body in sections:
+        carry = ""
         for piece in iter_text_slices(body):
-            for chunk in split_text_for_tts(piece, chunk_limit, max_bytes):
+            # Carry the (possibly short) tail of the previous slice into this
+            # one so slice boundaries never produce a runt chunk.
+            chunks = even_chunks((carry + "\n" + piece) if carry else piece, target, chunk_limit,
+                                 max_bytes=max_bytes)
+            carry = ""
+            if len(chunks) > 1 and len(chunks[-1]) < target * CHUNK_MIN_RATIO:
+                carry = chunks.pop()
+            for chunk in chunks:
                 # Separator lines such as "*** --- ***" have nothing to say;
                 # Edge-TTS returns an empty stream for them (NoAudioReceived),
                 # which would otherwise be retried forever as a "throttle".
                 if is_speakable(chunk):
                     plan.append((label, chunk))
+        if carry and is_speakable(carry):
+            plan.append((label, carry))
     return plan
 
 
@@ -1196,6 +1320,18 @@ def estimate_seconds(chars: int, rate: str) -> float:
 # =============================================================================
 # Render-server pool (health scoring + failover)
 # =============================================================================
+# url -> (quarantine_until, level, lifetime count, reason); shared by all jobs.
+_quarantine_memory: Dict[str, Tuple[float, int, int, str]] = {}
+
+
+def quarantine_info(url: str) -> Optional[Tuple[float, int, int, str]]:
+    """Live quarantine record for ``url`` (None when not benched)."""
+    q = _quarantine_memory.get(url)
+    if q and q[0] > time.time():
+        return q
+    return None
+
+
 @dataclass
 class ServerState:
     url: str
@@ -1210,10 +1346,65 @@ class ServerState:
     chars_done: int = 0
     # server-advertised /health max_concurrency (0 = unknown)
     advertised_limit: int = 0
+    # --- Microsoft-throttle quarantine (v4.3) ---------------------------------
+    # When Microsoft's Edge endpoint throttles *this server's IP* (HTTP 503 with
+    # NoAudioReceived / 403 ...) the server is benched for an escalating period
+    # while every other engine keeps working.  This is separate from the short
+    # ``cooldown_until`` used for transient errors (busy slot, timeout ...).
+    quarantine_until: float = 0.0
+    quarantine_level: int = 0
+    quarantine_reason: str = ""
+    quarantines: int = 0            # lifetime counter (shown in /servers)
+    clean_since_quarantine: int = 0  # successes since the last quarantine ended
 
     @property
     def label(self) -> str:
         return "built-in Edge-TTS" if self.is_local else self.url
+
+    @property
+    def short_label(self) -> str:
+        """Compact name for progress lines: ``built-in`` or the host's first label."""
+        if self.is_local:
+            return "built-in"
+        host = re.sub(r"^https?://", "", self.url).split("/")[0]
+        host = host.split(":")[0]
+        for suffix in (".onrender.com", ".herokuapp.com", ".railway.app", ".fly.dev", ".koyeb.app"):
+            if host.endswith(suffix):
+                host = host[: -len(suffix)]
+                break
+        return host[:28] or self.url[:28]
+
+    @property
+    def quarantined(self) -> bool:
+        return self.quarantine_until > time.time()
+
+    @property
+    def usable(self) -> bool:
+        """Not quarantined and not in a short cooldown."""
+        now = time.time()
+        return self.quarantine_until <= now and self.cooldown_until <= now
+
+    @property
+    def unavailable_until(self) -> float:
+        return max(self.quarantine_until, self.cooldown_until)
+
+    def status_icon(self) -> str:
+        if self.quarantined:
+            return "⛔"
+        if self.cooldown_until > time.time():
+            return "⏳"
+        return "✅"
+
+    def status_line(self) -> str:
+        """One-line live status, e.g. ``✅ yf3a 6/6`` or ``⛔ jg54 benched 1m40s (MS throttle)``."""
+        lim = self.limiter
+        now = time.time()
+        if self.quarantined:
+            return (f"⛔ {self.short_label} benched {fmt_duration(self.quarantine_until - now)} "
+                    f"(Microsoft throttle #{self.quarantines})")
+        if self.cooldown_until > now:
+            return f"⏳ {self.short_label} retry in {fmt_duration(self.cooldown_until - now)}"
+        return f"✅ {self.short_label} {lim.active}/{lim.current}"
 
     @property
     def tts_url(self) -> str:
@@ -1251,16 +1442,57 @@ class ServerPool:
         if not self.states:
             raise ValueError("No render servers are configured")
         self._rr = 0
+        # Inherit quarantines from previous jobs: a server Microsoft benched a
+        # minute ago is still benched for the job that starts now.
+        for s in self.states:
+            q = _quarantine_memory.get(s.url)
+            if q:
+                s.quarantine_until, s.quarantine_level, s.quarantines, s.quarantine_reason = q
+                if not s.quarantined:
+                    s.quarantine_until = 0.0
 
     def available(self) -> List[ServerState]:
-        now = time.time()
-        live = [s for s in self.states if s.cooldown_until <= now]
-        return live
+        """Engines that may take a request right now (not quarantined, not cooling)."""
+        return [s for s in self.states if s.usable]
+
+    def quarantined(self) -> List[ServerState]:
+        return [s for s in self.states if s.quarantined]
+
+    def quarantine(self, s: ServerState, reason: str = "") -> float:
+        """Bench ``s`` because *Microsoft* is throttling its IP.
+
+        Escalates 1 min -> 2 min -> 5 min -> 10 min while the server keeps
+        failing, and drops back one level after it has served
+        ``QUARANTINE_FORGIVE_AFTER`` clean chunks.  Other engines are unaffected -
+        the job simply routes around the benched server.  Returns the duration.
+        """
+        s.quarantine_level = min(s.quarantine_level + 1, len(QUARANTINE_STEPS))
+        duration = QUARANTINE_STEPS[s.quarantine_level - 1] + random.uniform(0, 5)
+        if len(self.states) == 1:
+            # Nothing to route around - keep the bench short, the job-level
+            # back-off in wait_for_engines() handles longer outages.
+            duration = min(duration, 30.0)
+        s.quarantine_until = max(s.quarantine_until, time.time() + duration)
+        s.quarantine_reason = (reason or s.last_error or "Microsoft throttling")[:200]
+        s.quarantines += 1
+        s.clean_since_quarantine = 0
+        s.streak = 0
+        s.cooldown_until = 0
+        if reason:
+            s.last_error = reason[:200]
+        # Come back gently: one request at a time until it proves healthy again.
+        lim = s.limiter
+        lim.current = 1
+        lim.report_throttle()
+        _quarantine_memory[s.url] = (s.quarantine_until, s.quarantine_level, s.quarantines, s.quarantine_reason)
+        log.warning("%s quarantined for %.0fs (level %d/%d): %s", s.label, duration, s.quarantine_level,
+                    len(QUARANTINE_STEPS), s.quarantine_reason)
+        return duration
 
     def pick(self) -> ServerState:
         live = self.available()
         if not live:
-            return min(self.states, key=lambda s: s.cooldown_until)
+            return min(self.states, key=lambda s: s.unavailable_until)
         self._rr += 1
         # Least-loaded first: most free slots, then lowest latency/failure score.
         # The round-robin counter only breaks exact ties so equal servers share
@@ -1282,6 +1514,13 @@ class ServerPool:
             s.latency = latency if not s.latency else (s.latency * 0.7 + latency * 0.3)
             s.last_error = ""
             s.chars_done += max(0, chars)
+            if s.quarantine_level:
+                s.clean_since_quarantine += 1
+                if s.clean_since_quarantine >= QUARANTINE_FORGIVE_AFTER:
+                    s.quarantine_level -= 1
+                    s.clean_since_quarantine = 0
+                    _quarantine_memory[s.url] = (s.quarantine_until, s.quarantine_level, s.quarantines,
+                                                 s.quarantine_reason)
             if not s.is_local:
                 remote_limiter(s.url).report_success()
         else:
@@ -1294,19 +1533,27 @@ class ServerPool:
                 s.cooldown_until = time.time() + min(180, 10 * s.streak)
 
     def all_cooling(self) -> bool:
-        """True when every engine is in cooldown (global throttle / outage)."""
-        now = time.time()
-        return all(s.cooldown_until > now for s in self.states)
+        """True when every engine is quarantined or cooling down (global throttle / outage)."""
+        return not self.available()
 
     def soonest_available(self) -> float:
-        """Seconds until at least one engine leaves cooldown (0 if one is free)."""
+        """Seconds until at least one engine becomes usable (0 if one is free)."""
         now = time.time()
-        return max(0.0, min(s.cooldown_until for s in self.states) - now)
+        return max(0.0, min(s.unavailable_until for s in self.states) - now)
 
     def reset_cooldowns(self) -> None:
+        """Clear the *short* cooldowns after a job-level pause.
+
+        Quarantines are kept: a server Microsoft is throttling does not recover
+        because we waited 10 s.  If *every* engine is still benched, the one
+        closest to release is let out so the job can probe it.
+        """
         for s in self.states:
             s.cooldown_until = 0
             s.streak = 0
+        if not self.available():
+            first = min(self.states, key=lambda s: s.quarantine_until)
+            first.quarantine_until = 0
 
     def failure_summary(self) -> str:
         """Human readable 'why did every engine fail' text for error messages."""
@@ -1314,6 +1561,10 @@ class ServerPool:
         if not parts:
             parts = [f"{s.label} -> no response" for s in self.states]
         return "; ".join(parts)
+
+    def status_lines(self) -> List[str]:
+        """Per-engine live status for progress / pause messages."""
+        return [s.status_line() for s in self.states]
 
     def concurrency(self) -> int:
         remote = sum(remote_limiter(s.url).current for s in self.states if not s.is_local)
@@ -1388,9 +1639,14 @@ async def _describe_http_error(resp: aiohttp.ClientResponse) -> str:
     if resp.status == 429:
         return f"HTTP 429: rate limited{(' - ' + detail) if detail else ''}"
     if resp.status in (502, 503, 504):
-        if "noaudio" in detail.lower().replace(" ", "") or "no audio" in detail.lower():
-            return f"HTTP {resp.status}: Microsoft Edge endpoint is throttling this server's IP (no audio) - will retry"
-        return f"HTTP {resp.status}: server busy / upstream error{(' - ' + detail) if detail else ''} - will retry"
+        low = detail.lower()
+        if "slots in use" in low or low.startswith("server busy"):
+            return f"HTTP {resp.status}: server busy - all synthesis slots in use - trying another server"
+        if "noaudio" in low.replace(" ", "") or "no audio" in low:
+            return f"HTTP {resp.status}: Microsoft Edge endpoint is throttling this server's IP (no audio) - server benched"
+        if "403" in low or "throttl" in low or "429" in low or "too many" in low or "handshake" in low:
+            return f"HTTP {resp.status}: Microsoft Edge endpoint is throttling this server's IP - server benched"
+        return f"HTTP {resp.status}: upstream error{(' - ' + detail) if detail else ''} - will retry"
     return f"HTTP {resp.status}{(': ' + detail) if detail else ''}"
 
 
@@ -1829,25 +2085,33 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
     payload = {"text": chunk, "voice": settings["voice"], "rate": settings["rate"],
                "pitch": settings["pitch"], "volume": settings["volume"]}
     rejected = set()
+    # A chunk may visit every engine once per round plus a few retries; with
+    # many servers MAX_CHUNK_ATTEMPTS alone would stop it before it reached a
+    # healthy one.
+    max_attempts = max(MAX_CHUNK_ATTEMPTS, len(pool.states) + 2)
     async with sem:
-        for attempt in range(1, MAX_CHUNK_ATTEMPTS + 1):
+        for attempt in range(1, max_attempts + 1):
             if cancel.is_set():
                 raise asyncio.CancelledError
             candidates = [s for s in pool.states if s.url not in rejected]
             if not candidates:
                 break
-            now_ts = time.time()
-            live = [s for s in candidates if s.cooldown_until <= now_ts]
+            live = [s for s in candidates if s.usable]
             if live:
                 # Least-loaded engine among the ones that are actually usable now.
                 server = pool.pick()
-                if server.url in rejected or server.cooldown_until > now_ts:
+                if server.url in rejected or not server.usable:
                     server = min(live, key=lambda s: (-s.free_slots, s.score))
             else:
-                # Every remaining engine is cooling down.  Never sleep long inside a
-                # slot: bounded wait, then let the pipeline decide.
-                server = min(candidates, key=lambda s: (s.cooldown_until, s.score))
-                delay = server.cooldown_until - now_ts
+                # Every remaining engine is quarantined / cooling down.  If any
+                # is only in a *short* cooldown, wait for it (bounded); if all
+                # are quarantined by Microsoft, give the round up right away so
+                # the pipeline can pause instead of burning attempts.
+                cooling_only = [s for s in candidates if not s.quarantined]
+                if not cooling_only:
+                    break
+                server = min(cooling_only, key=lambda s: (s.cooldown_until, s.score))
+                delay = server.cooldown_until - time.time()
                 if delay > 0:
                     await cancellable_sleep(min(delay, 10.0), cancel)
             if server.is_local:
@@ -1857,7 +2121,12 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
                 if data:
                     pool.report(server, True, time.monotonic() - t0, chars=len(chunk))
                     return index, data, dur
-                pool.report(server, False, error=local_last_error or "Edge-TTS returned no audio")
+                err = local_last_error or "Edge-TTS returned no audio"
+                pool.report(server, False, error=err)
+                if local_limiter.throttle_events and ("403" in err or "empty stream" in err or "no audio" in err):
+                    # Microsoft is throttling the bot host's own IP: bench the
+                    # built-in engine too so the render servers carry the job.
+                    pool.quarantine(server, err)
                 if len(pool.states) == 1:
                     # Nothing else to fail over to; the engine already retried internally.
                     break
@@ -1914,7 +2183,7 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
                                 except ValueError:
                                     retry_after = 5
                                 reason = await _describe_http_error(resp)
-                                busy = resp.status == 503 and ("slots in use" in reason or "server busy" in reason.lower())
+                                busy = resp.status == 503 and "slots in use" in reason
                                 if busy:
                                     # All synthesis slots on that server are taken - we simply sent
                                     # one request too many.  That is NOT Microsoft throttling the IP:
@@ -1924,10 +2193,27 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
                                     retry_after = min(retry_after, 3.0)
                                     server.last_error = reason[:200]
                                     server.cooldown_until = max(server.cooldown_until, time.time() + 1.0)
-                                else:
-                                    throttled = True
+                                elif resp.status == 429:
+                                    # The server's own request rate limit - short cooldown only.
                                     server.cooldown_until = max(server.cooldown_until, time.time() + retry_after)
                                     pool.report(server, False, error=reason)
+                                else:
+                                    # 502/503/504 with NoAudioReceived / "throttl" / 403: Microsoft
+                                    # is throttling THIS server's IP.  Bench only this server for
+                                    # an escalating period; every other engine keeps working and
+                                    # this chunk fails over to one of them immediately.
+                                    throttled = True
+                                    pool.report(server, False, error=reason)
+                                    if "throttling" in reason:
+                                        pool.quarantine(server, reason)
+                                        log.warning("Chunk %d: %s throttled by Microsoft -> quarantined, failing over",
+                                                    index, server.short_label)
+                                    else:
+                                        # Generic upstream error (timeout, 504...): short cooldown,
+                                        # escalate to quarantine only if it keeps happening.
+                                        server.cooldown_until = max(server.cooldown_until, time.time() + retry_after)
+                                        if server.streak >= 3:
+                                            pool.quarantine(server, reason)
                             else:
                                 pool.report(server, False, error=await _describe_http_error(resp))
                 finally:
@@ -1942,15 +2228,17 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
                 throttled = _is_throttle_error(exc)
                 pool.report(server, False, error=_describe_exc(exc))
                 log.debug("Chunk %d attempt %d failed on %s: %s", index, attempt, server.url, exc)
-            if throttled:
+            if throttled and not server.quarantined:
                 limiter.report_throttle()
-            if attempt < MAX_CHUNK_ATTEMPTS and len(rejected) < len(pool.states):
+            if attempt < max_attempts and len(rejected) < len(pool.states):
                 # Fail over immediately when another engine is free; the slot is
                 # too valuable to spend sleeping.  Only wait when everything else
                 # is cooling down as well.
                 others_live = [s for s in pool.states
-                               if s.url not in rejected and s.url != server.url and s.cooldown_until <= time.time()]
+                               if s.url not in rejected and s.url != server.url and s.usable]
                 if not others_live:
+                    if all(s.quarantined for s in pool.states if s.url not in rejected):
+                        break  # nothing will free up within seconds - let the job pause
                     await cancellable_sleep(min(retry_after, 10.0), cancel)
     log.warning("Chunk %d failed on every engine this round: %s", index, pool.failure_summary())
     return index, None, 0
@@ -1999,7 +2287,6 @@ bot = Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN
 admin_states: Dict[int, str] = {}          # admin_id -> pending input state
 pending_text: Dict[int, Tuple[str, str, float]] = {}  # token, text, expiry
 preview_tasks: Dict[int, asyncio.Task] = {}
-job_slots = asyncio.Semaphore(MAX_PARALLEL_JOBS)
 
 
 @dataclass
@@ -2008,6 +2295,13 @@ class Job:
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
     started: float = field(default_factory=time.time)
     task: Optional[asyncio.Task] = None
+    title: str = ""
+    chars: int = 0
+    queued_at: float = field(default_factory=time.time)
+    running_since: float = 0.0
+    # live progress (0..1) published by run_audiobook_job for /queue estimates
+    progress: float = 0.0
+    eta_seconds: float = 0.0
 
     def stop(self):
         self.cancel.set()
@@ -2019,10 +2313,167 @@ active_jobs: Dict[int, Job] = {}           # user_id -> running job
 BOT_START = time.time()
 
 
-def reserve_job(uid: int) -> Optional[Job]:
+class JobQueue:
+    """Ordered, visible job queue (v4.3).
+
+    Replaces the anonymous semaphore: every waiting job knows its position,
+    users see "You are #3 of 7" with a wait estimate, and admins get the full
+    list via /queue.  At most ``MAX_PARALLEL_JOBS`` jobs run at once.
+    """
+
+    def __init__(self, slots: int) -> None:
+        self.slots = max(1, slots)
+        self.waiting: List[Job] = []
+        self.running: List[Job] = []
+        self._waiters: List[asyncio.Future] = []
+
+    def _notify(self) -> None:
+        """Wake every coroutine blocked in ``acquire`` so it re-checks its position."""
+        for fut in self._waiters:
+            if not fut.done():
+                fut.set_result(None)
+        self._waiters.clear()
+
+    def position(self, job: Job) -> int:
+        """1-based position among waiting jobs (0 = running / not queued)."""
+        try:
+            return self.waiting.index(job) + 1
+        except ValueError:
+            return 0
+
+    def waiting_count(self) -> int:
+        return len(self.waiting)
+
+    def running_count(self) -> int:
+        return len(self.running)
+
+    def is_busy(self) -> bool:
+        return len(self.running) >= self.slots or bool(self.waiting)
+
+    def estimate_wait(self, job: Job) -> float:
+        """Rough seconds until ``job`` starts: remaining time of running jobs
+        plus an estimate for every job ahead of it in the queue."""
+        pos = self.position(job)
+        if pos == 0:
+            return 0.0
+        remaining = sorted(self._remaining(r) for r in self.running) or [0.0]
+        ahead = self.waiting[:pos - 1]
+        # Simple slot simulation: each queued job takes the earliest free slot.
+        slots = remaining[: self.slots]
+        while len(slots) < self.slots:
+            slots.append(0.0)
+        for j in ahead:
+            slots.sort()
+            slots[0] += self._full_estimate(j)
+        slots.sort()
+        return max(0.0, slots[0])
+
+    @staticmethod
+    def _full_estimate(job: Job) -> float:
+        # ~600 chars/s is a conservative multi-server figure; unknown size -> 10 min.
+        return job.chars / 600.0 if job.chars else 600.0
+
+    def _remaining(self, job: Job) -> float:
+        if job.eta_seconds > 0:
+            return job.eta_seconds
+        est = self._full_estimate(job)
+        if job.progress > 0:
+            return est * (1 - job.progress)
+        return est
+
+    async def acquire(self, job: Job, on_wait=None) -> None:
+        """Wait for a slot.  ``on_wait(position, total_waiting, eta)`` is called
+        whenever the position changes (and periodically) so the status message
+        can be refreshed."""
+        if job.cancel.is_set():
+            raise asyncio.CancelledError
+        if len(self.running) < self.slots and not self.waiting:
+            self.running.append(job)
+            job.running_since = time.time()
+            return
+        self.waiting.append(job)
+        self._notify()
+        last_pos = -1
+        last_ping = 0.0
+        try:
+            while True:
+                if job.cancel.is_set():
+                    raise asyncio.CancelledError
+                pos = self.position(job)
+                if pos == 1 and len(self.running) < self.slots:
+                    self.waiting.remove(job)
+                    self.running.append(job)
+                    job.running_since = time.time()
+                    self._notify()
+                    return
+                now = time.monotonic()
+                if on_wait is not None and (pos != last_pos or now - last_ping >= 20):
+                    last_pos, last_ping = pos, now
+                    with contextlib.suppress(Exception):
+                        await on_wait(pos, len(self.waiting), self.estimate_wait(job))
+                fut: asyncio.Future = asyncio.get_running_loop().create_future()
+                self._waiters.append(fut)
+                cancel_task = asyncio.create_task(job.cancel.wait())
+                try:
+                    # Wake on: queue change, /cancel, or every 5 s (refresh the ETA).
+                    await asyncio.wait({fut, cancel_task}, timeout=5.0, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    if fut in self._waiters:
+                        self._waiters.remove(fut)
+                    if not cancel_task.done():
+                        cancel_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await cancel_task
+        except BaseException:
+            if job in self.waiting:
+                self.waiting.remove(job)
+                self._notify()
+            raise
+
+    def release(self, job: Job) -> None:
+        if job in self.running:
+            self.running.remove(job)
+        if job in self.waiting:
+            self.waiting.remove(job)
+        self._notify()
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {"slots": self.slots, "running": len(self.running), "waiting": len(self.waiting)}
+
+    def describe(self, viewer: Optional[int] = None, admin: bool = False) -> str:
+        """Multi-line queue overview for /queue and the admin panel."""
+        lines = [f"📋 **Job queue** — {len(self.running)}/{self.slots} running, {len(self.waiting)} waiting"]
+        now = time.time()
+
+        def who(j: Job) -> str:
+            if admin:
+                return f"user `{j.user_id}`"
+            return "**you**" if j.user_id == viewer else "another user"
+
+        def name(j: Job) -> str:
+            t = html.escape((j.title or "")[:28])
+            return f" — {t}" if t and (admin or j.user_id == viewer) else ""
+
+        for j in self.running:
+            pct = int(j.progress * 100)
+            eta = f", ETA {fmt_duration(j.eta_seconds)}" if j.eta_seconds > 0 else ""
+            run_for = fmt_duration(now - j.running_since) if j.running_since else "-"
+            lines.append(f"▶️ {who(j)}{name(j)} — {pct}% (running {run_for}{eta})")
+        for i, j in enumerate(self.waiting, 1):
+            wait = fmt_duration(self.estimate_wait(j))
+            lines.append(f"{i}. ⏳ {who(j)}{name(j)} — ~{wait} until start")
+        if not self.running and not self.waiting:
+            lines.append("Queue is empty — your audiobook would start immediately.")
+        return "\n".join(lines)
+
+
+job_queue = JobQueue(MAX_PARALLEL_JOBS)
+
+
+def reserve_job(uid: int, title: str = "", chars: int = 0) -> Optional[Job]:
     if uid in active_jobs or len(active_jobs) >= MAX_QUEUED_JOBS:
         return None
-    job = Job(user_id=uid)
+    job = Job(user_id=uid, title=title, chars=chars)
     active_jobs[uid] = job
     return job
 
@@ -2169,7 +2620,8 @@ HELP_TEXT = (
     "/account – subscription & usage\n"
     "/history – your last jobs\n"
     "/resume – continue an interrupted audiobook\n"
-    "/cancel – cancel the running job\n"
+    "/cancel – cancel the running or queued job\n"
+    "/queue – see the job queue and your position\n"
     "/status – bot status\n"
     "/help – this message\n\n"
     + (f"Support: @{CONTACT_USERNAME}" if CONTACT_USERNAME else "")
@@ -2226,10 +2678,32 @@ async def cmd_status(client: Client, message: Message):
             f"Uptime: `{fmt_duration(time.time() - BOT_START)}`\n"
             f"TTS engine: `{engine}`\n"
             f"Render servers: `{len(servers)}`\n"
-            f"Running jobs: `{len(active_jobs)}/{MAX_PARALLEL_JOBS}`\n"
+            f"Running jobs: `{job_queue.running_count()}/{MAX_PARALLEL_JOBS}` | waiting: `{job_queue.waiting_count()}`\n"
             f"ffmpeg: `{'available' if FFMPEG else 'not installed'}`")
-    if uid in active_jobs:
-        text += f"\n\n⏳ Your job has been running for `{fmt_duration(time.time() - active_jobs[uid].started)}`"
+    job = active_jobs.get(uid)
+    if job is not None:
+        pos = job_queue.position(job)
+        if pos:
+            text += (f"\n\n📋 Your job is **#{pos} of {job_queue.waiting_count()}** in the queue "
+                     f"(~{fmt_duration(job_queue.estimate_wait(job))} until start)")
+        else:
+            text += (f"\n\n⏳ Your job has been running for `{fmt_duration(time.time() - job.started)}` "
+                     f"({int(job.progress * 100)}%)")
+    text += "\n\nSend /queue to see the full queue."
+    await message.reply(text)
+
+
+@bot.on_message(filters.command("queue") & filters.private)
+async def cmd_queue(client: Client, message: Message):
+    """Show the visible job queue: who is running, who is waiting, and positions."""
+    uid = message.from_user.id
+    if not db.is_approved(uid) and not db.is_admin(uid):
+        return
+    text = job_queue.describe(viewer=uid, admin=db.is_admin(uid))
+    job = active_jobs.get(uid)
+    if job is not None and job_queue.position(job):
+        text += (f"\n\n👉 You are **#{job_queue.position(job)}** — estimated start in "
+                 f"~{fmt_duration(job_queue.estimate_wait(job))}.")
     await message.reply(text)
 
 
@@ -2709,14 +3183,21 @@ async def btn_server_status(client: Client, message: Message):
                 if lim["throttle_events"]:
                     extra += f" · throttles {lim['throttle_events']}"
                 extra += " · 🔐 auth OK" if r.get("auth_required") else " · 🔓 no key"
-            lines.append(f"{i}. 🟢 `{label}`{extra}")
+            q = quarantine_info(r["url"])
+            if q:
+                lines.append(f"{i}. ⛔ `{label}`{extra}\n   ↳ benched {fmt_duration(q[0] - time.time())} more "
+                             f"(Microsoft throttle #{q[2]}, level {q[1]}): {html.escape(q[3])[:100]}")
+            else:
+                lines.append(f"{i}. 🟢 `{label}`{extra}")
         else:
             reason = html.escape(r.get("error") or "offline")[:200]
-            lines.append(f"{i}. 🔴 `{label}` — {reason}")
+            q = quarantine_info(r["url"])
+            bench = f" · ⛔ benched {fmt_duration(q[0] - time.time())} more" if q else ""
+            lines.append(f"{i}. 🔴 `{label}`{bench} — {reason}")
     lines.append(f"\n✅ Online: **{online}/{len(servers)}**")
     running = db.running_jobs()
-    if running:
-        lines.append(f"🎧 Jobs in progress: {len(running)} (see /jobs)")
+    if running or job_queue.waiting:
+        lines.append(f"🎧 Jobs: {job_queue.running_count()} running, {job_queue.waiting_count()} waiting (see /jobs, /queue)")
     lines.append(f"\n_Probe = real {len(PROBE_TEXT)}-char Hindi synthesis on every engine. "
                  f"Jobs never fail on a throttled engine: they pause and retry automatically._")
     if not TTS_API_KEY and any(r.get("auth_required") for r in results):
@@ -3005,9 +3486,9 @@ async def cb_text_confirm(client: Client, cq: CallbackQuery):
         return
     await cq.answer()
     await safe_edit(cq.message, "🚀 Starting…")
-    job = reserve_job(uid)
+    job = reserve_job(uid, title="Text", chars=len(text))
     if job is None:
-        await safe_edit(cq.message, "The job queue is full. Please try again later.")
+        await safe_edit(cq.message, f"The job queue is full ({MAX_QUEUED_JOBS} jobs). Please try again later.")
         return
     job.task = asyncio.create_task(run_audiobook_job(client, cq.message, uid, text=text,
                                                     source="text message", title="Text", job=job))
@@ -3044,10 +3525,15 @@ async def handle_document(client: Client, message: Message):
         await message.reply("⏳ You already have a job running. Use /cancel to stop it first.")
         return
 
-    job = reserve_job(uid)
+    job = reserve_job(uid, title=os.path.splitext(name)[0], chars=int((doc.file_size or 0) // 2))
     if job is None:
-        await message.reply("The job queue is full. Please try again later.")
+        await message.reply(f"The job queue is full ({MAX_QUEUED_JOBS} jobs). Please try again later.")
         return
+    if job_queue.is_busy():
+        await message.reply(
+            f"📋 {job_queue.running_count()}/{job_queue.slots} job(s) running, "
+            f"{job_queue.waiting_count()} waiting. Your file will be downloaded now and queued - "
+            f"you will see your position shortly.")
     job.task = asyncio.create_task(document_job(client, message, job, name, ext))
     track_job(job)
 
@@ -3150,21 +3636,33 @@ async def wait_for_engines(pool: ServerPool, session: aiohttp.ClientSession, can
     stops this loop.
     """
     pause = STALL_BACKOFF_STEPS[min(stall_round, len(STALL_BACKOFF_STEPS) - 1)] + random.uniform(0, 3)
-    pause = max(pause, pool.soonest_available())
+    # Wait until the first benched engine is released (capped so a 10-minute
+    # quarantine never blocks a job that could use a server released sooner).
+    pause = min(max(pause, pool.soonest_available()), 300.0)
     reason = pool.failure_summary()[:300]
     log.warning("Job %s paused (round %d, %.0fs): %s", job_id, stall_round + 1, pause, reason)
     db.job_set_status(job_id, "paused", f"round {stall_round + 1}: {reason}")
     percent = int(done / total * 100) if total else 0
+    benched = pool.quarantined()
+    if benched and len(benched) == len(pool.states):
+        headline = "⏸ Microsoft is throttling **every** TTS server right now."
+    elif benched:
+        headline = "⏸ All remaining TTS engines are busy right now."
+    else:
+        headline = "⏸ All TTS engines are busy or unreachable right now."
+    engine_lines = "\n".join(f"  {html.escape(line)}" for line in pool.status_lines()[:8])
     await safe_edit(status,
                     f"**Generating audiobook**\n"
-                    f"[{progress_bar(percent)}] {percent}% ({done}/{total})\n\n"
-                    f"⏸ All TTS engines are busy or throttled right now.\n"
+                    f"[{progress_bar(percent)}] {percent}% ({done}/{total} chunks)\n\n"
+                    f"{headline}\n"
                     f"Waiting {fmt_duration(pause)} and retrying automatically (attempt {stall_round + 1}).\n"
-                    f"Nothing is lost - the job continues from where it stopped.\n"
-                    f"Reason: {html.escape(reason)[:180]}",
+                    f"Nothing is lost - the job continues from where it stopped.\n\n"
+                    f"**Engines:**\n{engine_lines}\n\n"
+                    f"Last error: {html.escape(reason)[:160]}",
                     cancel_markup)
     await cancellable_sleep(pause, cancel)
     # Give every engine a fresh chance; the limiters will shrink again if needed.
+    # Quarantines are kept - benched servers come back on their own schedule.
     pool.reset_cooldowns()
     if local_limiter.throttle_events:
         local_limiter.throttle_events = max(0, local_limiter.throttle_events - 1)
@@ -3265,8 +3763,26 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: Opt
                     f.write(text)
             text = None  # free memory; we re-read from disk when planning
 
-        if job_slots.locked():
-            await safe_edit(status, "Your audiobook is queued. You can cancel while waiting.", cancel_markup)
+        # Queue metadata for the visible queue (/queue, position messages).
+        job.title = title or job.title
+        if not job.chars:
+            # Rough size for queue wait estimates (UTF-8 bytes; Indic text is ~3 B/char).
+            with contextlib.suppress(OSError):
+                job.chars = max(1, os.path.getsize(os.path.join(jdir, "source.txt")) // 2)
+        if resume_job_id is not None and next_write and plan:
+            job.progress = next_write / max(1, len(plan))
+
+        async def on_queue_wait(pos: int, total: int, eta: float) -> None:
+            running = job_queue.running_count()
+            await safe_edit(status,
+                            f"📋 **Your audiobook is queued**\n\n"
+                            f"Position: **#{pos} of {total}** waiting\n"
+                            f"Running now: {running}/{job_queue.slots} job(s)\n"
+                            f"Estimated start: ~{fmt_duration(eta)}\n\n"
+                            f"**{html.escape(title)[:60]}**\n"
+                            f"You will be notified automatically. Send /queue to see the full queue "
+                            f"or tap Cancel to leave it.",
+                            cancel_markup)
 
         out_path = os.path.join(jdir, "part.mp3")
 
@@ -3380,7 +3896,8 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: Opt
                 uploader_task = None
             check_uploader()
 
-        async with job_slots:
+        await job_queue.acquire(job, on_queue_wait)
+        try:
             if job.cancel.is_set():
                 raise asyncio.CancelledError
             if not db.is_approved(uid):
@@ -3418,9 +3935,17 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: Opt
                     if url in usable:
                         pool.apply_probe(url, info)
                 for s in pool.states:
-                    if s.url in cooling:
-                        s.cooldown_until = time.time() + 20
-                        s.last_error = "temporarily unavailable at job start"
+                    if s.url in cooling and not s.quarantined:
+                        err = next((i.get("error") or "" for u, i in zip(remote, probes) if u == s.url), "")
+                        if "throttling" in err or "benched" in err:
+                            # The probe itself hit Microsoft's throttle - bench right away.
+                            pool.quarantine(s, err)
+                        else:
+                            s.cooldown_until = time.time() + 20
+                            s.last_error = err or "temporarily unavailable at job start"
+                    if s.quarantined:
+                        log.info("Job %s: %s starts benched (%s left, Microsoft throttle)", job_id, s.label,
+                                 fmt_duration(s.quarantine_until - time.time()))
                 if skipped:
                     await safe_edit(status, "Skipping misconfigured engine(s):\n" +
                                     "\n".join(f"- {html.escape(s)[:160]}" for s in skipped[:5]) +
@@ -3524,6 +4049,8 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: Opt
                     cps = fresh_chars / elapsed if fresh_chars else 0.0
                     eta = (total_chars - done_chars) / cps if cps > 0 else 0.0
                     speed = (gen_audio_ms / 1000.0) / elapsed if gen_audio_ms else 0.0
+                    job.progress = done_chars / total_chars if total_chars else 1.0
+                    job.eta_seconds = eta
                     engines = len(pool.states)
                     active = pool.active()
                     par = pool.concurrency()
@@ -3533,13 +4060,22 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: Opt
                         upload_line = f"\nUploading part {uploading.get('number')} ({fmt_size(uploading.get('size', 0))}) in background"
                     else:
                         upload_line = ""
+                    benched = len(pool.quarantined())
+                    engine_head = f"{engines - benched}/{engines} engine(s) active | {active}/{par} requests in flight"
+                    if benched:
+                        engine_head += f" | ⛔ {benched} benched (Microsoft throttle)"
+                    engine_lines = "\n".join(f"  {html.escape(line)}" for line in pool.status_lines()[:8])
+                    queue_line = ""
+                    waiting = job_queue.waiting_count()
+                    if waiting:
+                        queue_line = f"\n📋 {waiting} job(s) waiting in queue behind you"
                     await safe_edit(status,
                                     f"**Generating audiobook**\n"
                                     f"[{progress_bar(percent)}] {percent}% ({done_chunks}/{total_chunks} chunks)\n"
                                     f"Delivered: {delivered} parts | ETA {fmt_duration(eta)}\n"
                                     f"{speed_line}\n"
-                                    f"{engines} engine(s) | {active}/{par} requests in flight"
-                                    f"{upload_line}",
+                                    f"{engine_head}\n{engine_lines}"
+                                    f"{upload_line}{queue_line}",
                                     cancel_markup)
 
                 await report_progress(force=True)
@@ -3638,6 +4174,8 @@ async def run_audiobook_job(client: Client, status: Message, uid: int, text: Opt
                                             f"{(' (' + fmt_size(uploading['size']) + ')') if uploading.get('size') else ''}…",
                                     cancel_markup)
                 await drain_uploads()
+        finally:
+            job_queue.release(job)
         outcome = "done"
         keep_files = False
         await safe_edit(status, f"**Audiobook complete!**\n{delivered} part(s) delivered | "
@@ -3738,10 +4276,10 @@ async def cmd_jobs(client: Client, message: Message):
     if not _is_admin_msg(message):
         return
     rows = db.fetchall("SELECT * FROM jobs WHERE status IN ('running','paused','interrupted') ORDER BY id DESC LIMIT 20")
-    if not rows:
-        await message.reply("No running, paused or interrupted jobs.")
+    if not rows and not job_queue.waiting and not job_queue.running:
+        await message.reply("No running, paused, queued or interrupted jobs.")
         return
-    lines = ["**Jobs**"]
+    lines = [job_queue.describe(admin=True), "", "**Job records**"]
     for r in rows:
         total = r["total_chunks"] or 0
         done = r["done_chunks"] or 0

@@ -296,9 +296,157 @@ def test_render_server_plan_needs_far_fewer_requests_for_hindi():
     old_plan = bot.build_plan(text, 3000, bot.LOCAL_TTS_MAX_BYTES, False)
     limit, max_bytes = bot.plan_limits([{"ok": True, "max_text_length": 6000}])
     new_plan = bot.build_plan(text, limit, max_bytes, False)
-    assert len(new_plan) * 2 <= len(old_plan)
+    # Byte-capped Hindi chunks are ~1300-1500 chars; remote chunks ~2700 (90% of 3000).
+    assert len(new_plan) * 1.7 <= len(old_plan)
     assert all(len(c) <= 6000 for _, c in new_plan)
     assert "".join(c for _, c in new_plan).replace(" ", "").replace("\n", "") == text.replace(" ", "")
+
+
+# ---------------------------------------------------------------------------
+# v4.3: even chunk sizes
+# ---------------------------------------------------------------------------
+def test_even_chunks_are_uniform_and_never_tiny():
+    import random
+    random.seed(7)
+    paras = []
+    for _ in range(300):
+        n = random.choice([1, 1, 2, 3, 8, 20, 40])
+        paras.append(" ".join(f"यह वाक्य संख्या {j} है।" for j in range(n)))
+    text = "\n\n".join(paras)
+    limit = 3000
+    plan = bot.build_plan(text, limit, None, False)
+    sizes = [len(c) for _, c in plan]
+    target = bot.chunk_target(limit)
+    assert all(s <= limit for s in sizes)
+    # No chunk (except possibly the very last) is below 60% of the target.
+    assert all(s >= target * bot.CHUNK_MIN_RATIO for s in sizes[:-1])
+    # And the plan is dense: average size close to the target.
+    assert sum(sizes) / len(sizes) >= target * 0.8
+    # Nothing lost: every sentence is still present.
+    joined = " ".join(c for _, c in plan)
+    assert joined.count("है।") == text.count("है।")
+
+
+def test_even_chunks_respect_byte_cap_and_sentences():
+    text = ("यह एक बहुत लंबा वाक्य है जिसमें कई शब्द हैं। " * 400).strip()
+    chunks = bot.even_chunks(text, 2700, 3000, max_bytes=3900)
+    assert all(bot.edge_payload_bytes(c) <= 3900 for c in chunks)
+    assert all(c.endswith("।") for c in chunks)  # cut only at sentence ends
+    sizes = [len(c) for c in chunks]
+    assert max(sizes) - min(sizes) <= max(sizes) * 0.5  # last chunk re-balanced, not a runt
+
+
+def test_even_chunks_hard_splits_giant_sentence():
+    text = "शब्द " * 2000  # one 10k-char "sentence" with no terminator
+    chunks = bot.even_chunks(text, 900, 1000)
+    assert all(len(c) <= 1000 for c in chunks)
+    assert "".join(chunks).replace(" ", "") == text.replace(" ", "")
+
+
+# ---------------------------------------------------------------------------
+# v4.3: per-server Microsoft-throttle quarantine
+# ---------------------------------------------------------------------------
+def test_quarantine_benches_only_one_server():
+    bot._quarantine_memory.clear()
+    pool = bot.ServerPool(["https://a.onrender.com", "https://b.onrender.com", bot.LOCAL_TTS_URL])
+    a, b, local = pool.states
+    pool.quarantine(a, "HTTP 503: Microsoft Edge endpoint is throttling this server's IP")
+    assert a.quarantined and not b.quarantined and not local.quarantined
+    assert a not in pool.available() and b in pool.available()
+    assert not pool.all_cooling()
+    # pick() never returns a benched server while others are usable
+    for _ in range(20):
+        assert pool.pick() is not a
+    # escalates
+    first = a.quarantine_until
+    pool.quarantine(a, "again")
+    assert a.quarantine_level == 2 and a.quarantine_until >= first
+    # reset_cooldowns keeps quarantines
+    pool.reset_cooldowns()
+    assert a.quarantined
+    # status lines mention the bench
+    lines = pool.status_lines()
+    assert any("benched" in ln and ln.startswith("⛔ a") for ln in lines)
+    assert any(ln.startswith("✅") for ln in lines)
+    # remembered across pools (new job)
+    pool2 = bot.ServerPool(["https://a.onrender.com"])
+    assert pool2.states[0].quarantined
+    assert bot.quarantine_info("https://a.onrender.com") is not None
+    bot._quarantine_memory.clear()
+
+
+def test_quarantine_forgiveness_after_clean_chunks():
+    bot._quarantine_memory.clear()
+    pool = bot.ServerPool(["https://a.onrender.com", "https://b.onrender.com"])
+    a = pool.states[0]
+    pool.quarantine(a, "throttle")
+    a.quarantine_until = 0  # released
+    for _ in range(bot.QUARANTINE_FORGIVE_AFTER):
+        pool.report(a, True, 0.5, chars=100)
+    assert a.quarantine_level == 0
+    bot._quarantine_memory.clear()
+
+
+def test_reset_cooldowns_releases_one_when_all_benched():
+    bot._quarantine_memory.clear()
+    pool = bot.ServerPool(["https://a.onrender.com", "https://b.onrender.com"])
+    for s in pool.states:
+        pool.quarantine(s, "throttle")
+    assert pool.all_cooling()
+    pool.reset_cooldowns()
+    assert len(pool.available()) == 1
+    bot._quarantine_memory.clear()
+
+
+def test_short_label():
+    assert bot.ServerState("https://tts-server-1-jg54.onrender.com").short_label == "tts-server-1-jg54"
+    assert bot.ServerState(bot.LOCAL_TTS_URL).short_label == "built-in"
+
+
+# ---------------------------------------------------------------------------
+# v4.3: visible job queue
+# ---------------------------------------------------------------------------
+def test_job_queue_positions_and_estimates():
+    import asyncio
+
+    async def scenario():
+        q = bot.JobQueue(1)
+        j1 = bot.Job(user_id=1, title="One", chars=60_000)
+        j2 = bot.Job(user_id=2, title="Two", chars=60_000)
+        j3 = bot.Job(user_id=3, title="Three", chars=60_000)
+        await q.acquire(j1)
+        assert q.running_count() == 1 and q.position(j1) == 0
+        seen = []
+
+        async def on_wait(pos, total, eta):
+            seen.append((pos, total, eta))
+
+        t2 = asyncio.create_task(q.acquire(j2, on_wait))
+        t3 = asyncio.create_task(q.acquire(j3, on_wait))
+        await asyncio.sleep(0.05)
+        assert q.position(j2) == 1 and q.position(j3) == 2 and q.waiting_count() == 2
+        assert q.estimate_wait(j3) > q.estimate_wait(j2) > 0
+        text = q.describe(viewer=3)
+        assert "1. ⏳ another user" in text and "2. ⏳ **you**" in text
+        admin = q.describe(admin=True)
+        assert "user `2`" in admin and "Two" in admin
+        # finishing j1 promotes j2, j3 moves to #1
+        q.release(j1)
+        await asyncio.wait_for(t2, 3)
+        await asyncio.sleep(0.05)
+        assert q.position(j2) == 0 and q.position(j3) == 1
+        assert any(p == 2 for p, _, _ in seen) and any(p == 1 for p, _, _ in seen)
+        # cancelling a waiting job removes it from the queue
+        j3.cancel.set()
+        try:
+            await asyncio.wait_for(t3, 3)
+        except asyncio.CancelledError:
+            pass
+        assert q.waiting_count() == 0
+        q.release(j2)
+        assert not q.is_busy()
+
+    asyncio.run(scenario())
 
 
 def test_pool_pick_prefers_engine_with_most_free_slots():
