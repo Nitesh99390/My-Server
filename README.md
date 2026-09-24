@@ -9,7 +9,30 @@ neural voices** (`edge-tts`) — no API key, no paid TTS service.
 | `bot.py` | Telegram bot (Pyrogram/MTProto, uploads up to 2 GB). **Built-in free Edge-TTS engine**, chunking, chapter splitting, optional multi-server load balancing, progress bar, user approval system, admin panel. |
 | `app.py` | *Optional* Flask micro-service wrapping `edge-tts` for extra render capacity on other IPs. `/tts`, `/tts/stream`, `/tts/subtitles`, `/voices`, `/health`, `/stats`. |
 
-Version: **bot 4.2.1 / server 4.1.1**
+Version: **bot 4.3.0 / server 4.1.1**
+
+---
+
+## 🛡️ v4.3: one throttled server no longer stalls the job · even chunks · visible queue
+
+The screenshot symptom: `tts-server-1-jg54 -> HTTP 503: Microsoft Edge endpoint is
+throttling this server's IP` and the whole job sitting at *"All TTS engines are busy or
+throttled … waiting 6s"* while the other server (`yf3a`) was perfectly healthy.
+
+**Root cause** — a Microsoft-throttled server only got a 5-10 s cooldown, so the
+least-loaded scheduler kept picking it again; after 4 failed attempts the chunk was
+reported as *"failed on every engine"* and the job paused, and the pause reset the
+cooldown so the cycle repeated.
+
+| Fix | Details |
+|-----|---------|
+| **Per-server quarantine** | A `503/502 NoAudioReceived` / `403` / `throttl…` reply benches **only that server** for `QUARANTINE_STEPS` = 1 min → 2 min → 5 min → 10 min (escalating; level drops after `QUARANTINE_FORGIVE_AFTER` clean chunks). The chunk fails over to the next engine immediately. Quarantines survive job-level pauses and carry over to the next job. A benched server comes back at concurrency 1 and ramps up again. |
+| **Job pauses only when *every* engine is out** | `fetch_chunk` gives a chunk as many attempts as there are engines; it never sleeps on a benched server. `wait_for_engines` reports *"Microsoft is throttling every TTS server"* vs *"all remaining engines busy"* and shows a per-engine list (`✅ yf3a 6/6 · ⛔ jg54 benched 1m40s (Microsoft throttle #1)`). |
+| **Even chunk sizes** | New `even_chunks()` planner packs sentences to a target (`TARGET_CHUNK_CHARS`, default 90 % of the engine limit) and never emits a chunk below `CHUNK_MIN_PERCENT` (60 %) of it except at a chapter's very end — a trailing runt is merged or the last two chunks are re-balanced. Hindi with 3000-char servers: every chunk ≈ 2200-2750 chars instead of 300-3000. |
+| **Visible job queue** | `job_slots` semaphore replaced by an ordered `JobQueue`. Waiting users see **"Position #3 of 7 · running 1/1 · estimated start ~12 min"**, refreshed as the queue moves. New **/queue** command (users: your position + anonymised list; admins: user ids, titles, progress, ETA). `/status`, `/jobs` and the progress message show running / waiting counts. |
+| **Server-status panel** | `/servers` shows `⛔ benched 4m10s more (Microsoft throttle #2, level 2)` for quarantined servers; the job-start probe benches a server whose probe already hit Microsoft's throttle. |
+
+> Bot-only change — redeploy `bot.py`. Render servers (`app.py` 4.1.1) are unchanged.
 
 ---
 
@@ -64,7 +87,7 @@ book as "all engines throttled": retry → halve limiter → pause → retry …
 | Only the built-in engine had an adaptive limiter; remote servers used a fixed semaphore | **One adaptive limiter per server** (starts at `PER_SERVER_CONCURRENCY`, grows to 2× while healthy, halves on 429/502/503/timeout). Throughput scales linearly with servers; `MAX_TOTAL_CONCURRENCY=64` is the only global cap. |
 | `/servers` probe said "OK" with a 2-letter text | Probe is a real ~120-char Hindi synthesis on every engine and shows each server's live limit / throttle count. |
 
-New commands: `/resume` (user) · `/jobs` (admin: running / paused / interrupted jobs with progress and last stall reason).
+New commands: `/resume` (user) · `/jobs` (admin: running / paused / interrupted jobs with progress and last stall reason) · `/queue` (v4.3: queue positions).
 
 > Put `JOBS_DIR` (and `DB_PATH`) on a persistent disk when hosting on Render so resume survives redeploys.
 
@@ -165,6 +188,7 @@ Most common causes:
 | `HTTP 429 rate limited` | Too many parallel requests for that server; lower `PER_SERVER_CONCURRENCY`. |
 | `timed out` | Free Render instance was asleep or overloaded; the bot retries and falls back to the built-in engine. |
 | `built-in Edge-TTS -> ... 403` | Microsoft throttled the bot host IP; wait a few minutes or add a render server on another IP. |
+| `HTTP 503: Microsoft Edge endpoint is throttling this server's IP - server benched` | Normal under load: only that server is quarantined (1→10 min escalating), the job continues on the others. `/servers` shows how long it stays benched. |
 | `built-in engine disabled` | `pip install edge-tts` on the bot host, or set `LOCAL_TTS_ENABLED=true`. |
 
 **Add Server** and **/servers** now run a real authenticated test synthesis, so a
@@ -176,7 +200,8 @@ remaining engines.
 
 - `/start` – menu, `/settings` – voice / rate / pitch / volume / split mode
 - Send a document or paste text → **🎧 Create Audio**
-- `/preview` – 1-line voice sample, `/cancel` – stop current job
+- `/preview` – 1-line voice sample, `/cancel` – stop current (or queued) job
+- `/queue` – job queue with your position and estimated start
 - `/history`, `/account`, `/status`
 - Admin: `/admin`, `/servers`, `/users`, `/stats`, approve/revoke, broadcast
 
