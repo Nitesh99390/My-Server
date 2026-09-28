@@ -1,0 +1,32 @@
+# Cloudflare Worker version of the Edge-TTS render server (app.py).
+#
+#   npm install
+#   npx wrangler login
+#   npx wrangler secret put API_KEY        # optional - same value as TTS_API_KEY on the bot
+#   npx wrangler deploy
+#
+# Then register  https://<name>.<account>.workers.dev  in the bot
+# (Admin Panel -> Add Server).  No Python, no gunicorn, no cold starts.
+name = "edge-tts-worker"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Observability (free): see request logs in the Cloudflare dashboard.
+[observability]
+enabled = true
+
+[vars]
+# All optional - identical semantics to the env vars of app.py.
+MAX_TEXT_LENGTH = "6000"
+# Slots the Worker *advertises* to the bot on /health.  Each Worker request is
+# independent, so this is the bot-side per-server ceiling (its limiter never
+# exceeds max_concurrency), not a hard cap inside the Worker.
+MAX_CONCURRENCY = "6"
+DEFAULT_VOICE = "hi-IN-MadhurNeural"
+TTS_RETRIES = "3"
+ATTEMPT_TIMEOUT = "75"
+ENABLE_CORS = "true"
+# Cache synthesised audio in Cloudflare's edge cache (seconds; 0 = disabled).
+CACHE_TTL = "3600"
+# API_KEY -> set with `wrangler secret put API_KEY` (never put it in [vars]).

@@ -1,0 +1,2 @@
+# Copy to .dev.vars for `wrangler dev` (never commit .dev.vars)
+API_KEY=

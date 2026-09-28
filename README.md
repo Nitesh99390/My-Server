@@ -8,8 +8,9 @@ neural voices** (`edge-tts`) — no API key, no paid TTS service.
 |------|------|
 | `bot.py` | Telegram bot (Pyrogram/MTProto, uploads up to 2 GB). **Built-in free Edge-TTS engine**, chunking, chapter splitting, optional multi-server load balancing, progress bar, user approval system, admin panel. |
 | `app.py` | *Optional* Flask micro-service wrapping `edge-tts` for extra render capacity on other IPs. `/tts`, `/tts/stream`, `/tts/subtitles`, `/voices`, `/health`, `/stats`. |
+| `worker/` | **Cloudflare Worker edition of the render server** - same API as `app.py`, zero Python, no cold starts, free tier. See [§1b](#1b-deploy-the-render-server-as-a-cloudflare-worker-worker). |
 
-Version: **bot 4.3.0 / server 4.1.1**
+Version: **bot 4.3.0 / server 4.1.1 / worker 4.1.1-cf**
 
 ---
 
@@ -151,6 +152,53 @@ curl -X POST https://your-server/tts -H 'X-API-Key: mysecret' \
      -H 'Content-Type: application/json' \
      -d '{"text":"नमस्ते दुनिया","voice":"hi-IN-MadhurNeural"}' -o out.mp3
 ```
+
+## 1b. Deploy the render server as a Cloudflare Worker (`worker/`)
+
+`worker/` is a line-for-line JavaScript port of `app.py` (Edge-TTS websocket protocol,
+DRM `Sec-MS-GEC` token, 4096-byte SSML splitting, word boundaries, script detection,
+subtitles). The bot cannot tell the difference: same endpoints, same JSON, same headers
+(`X-Duration-Ms`, `X-Char-Count`, `X-Voice`, `X-Cache`), same status codes
+(`400` unreadable voice/text, `401` bad key, `503 + Retry-After` throttled, `502` upstream).
+
+| | Render (`app.py`) | Cloudflare Worker (`worker/`) |
+|--|--|--|
+| Runtime | Python / Flask / gunicorn | V8 isolate, no dependencies |
+| Cold start | 30-60 s after sleep on free tier | none |
+| Free quota | 750 h/month, 1 instance | 100 000 requests/day, global |
+| Audio cache | in-memory LRU | Cloudflare Cache API (`CACHE_TTL`) |
+| Concurrency | `MAX_CONCURRENCY` semaphore | one isolate per request; `MAX_CONCURRENCY` is what `/health` advertises so the bot's limiter stays ≤ 6-8 per server |
+
+**Deploy (≈2 minutes):**
+```bash
+cd worker
+npm install
+npx wrangler login                     # opens the browser once
+npx wrangler secret put API_KEY        # optional - must equal TTS_API_KEY on the bot
+npx wrangler deploy                    # -> https://edge-tts-worker.<account>.workers.dev
+```
+Then register that URL in the bot (**Admin Panel -> Add Server** or `TTS_SERVERS=`). Deploy
+several Workers under different names if you want more parallel capacity - each is a
+separate server to the bot.
+
+Configuration lives in `worker/wrangler.toml` (`[vars]`): `MAX_TEXT_LENGTH=6000`,
+`MAX_CONCURRENCY=6`, `DEFAULT_VOICE`, `TTS_RETRIES=3`, `ATTEMPT_TIMEOUT=75`, `CACHE_TTL=3600`,
+`ENABLE_CORS`. `API_KEY` is a secret (`wrangler secret put`), never a var.
+
+**Local dev / tests:**
+```bash
+cd worker
+cp .dev.vars.example .dev.vars        # optional API_KEY for local runs
+npm run dev                           # http://127.0.0.1:8787
+npm test                              # protocol + validation unit tests (+1 live Edge-TTS call)
+curl -X POST http://127.0.0.1:8787/tts -H 'Content-Type: application/json' \
+     -d '{"text":"नमस्ते दुनिया","voice":"hi-IN-MadhurNeural"}' -o out.mp3
+```
+
+> Limits to know: a Worker request may run for a long time on the free plan only while
+> the client stays connected (the bot waits up to 240 s per chunk, the Worker gives up at
+> `SYNTH_TIMEOUT=200`), and free-plan CPU time is 10 ms/request - websocket I/O does not
+> count towards it, so even 6000-char chunks fit comfortably.
 
 ## 2. Run the bot (`bot.py`)
 
