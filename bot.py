@@ -108,7 +108,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
-VERSION = "5.0.0"
+VERSION = "5.0.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -144,11 +144,14 @@ _load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 import aiohttp  # noqa: E402
 
-# Pyrogram 2.x expects an event loop at import time on Python 3.12+.
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
+# Pyrogram 2.x captures ``asyncio.get_event_loop()`` when ``Client()`` is
+# constructed (Client.loop / Dispatcher.loop) and later creates its handler
+# worker tasks on THAT loop.  If the bot is then started with ``asyncio.run()``
+# a *second* loop is used, the handler tasks never run and every button /
+# command is silently ignored (the bot logs "logged in" but never answers).
+# So: create one loop up-front, make it current, and run everything on it.
+LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(LOOP)
 
 from pyrogram import Client, filters  # noqa: E402
 from pyrogram.errors import FloodWait, MessageNotModified, RPCError  # noqa: E402
@@ -1448,6 +1451,7 @@ http_session: Optional[aiohttp.ClientSession] = None
 
 admin_states: Dict[int, str] = {}                      # admin_id -> pending input state
 pending_text: Dict[int, Tuple[str, str, float]] = {}   # uid -> (token, text, expiry)
+pending_servers: Dict[str, Tuple[List[str], float]] = {}  # token -> (urls that failed the probe, expiry)
 preview_tasks: Dict[int, asyncio.Task] = {}
 
 
@@ -2609,7 +2613,7 @@ async def handle_document(client: Client, message: Message):
 
 @bot.on_message(filters.text & filters.private & ~filters.command(
     ["start", "help", "status", "queue", "account", "history", "settings", "preview", "cancel", "resume", "jobs",
-     "admin", "servers", "users", "stats"]))
+     "admin", "servers", "users", "stats", "addserver", "add_server"]))
 async def text_handler(client: Client, message: Message):
     uid = message.from_user.id
     text = message.text or ""
@@ -2772,7 +2776,8 @@ async def admin_panel(client: Client, message: Message):
     pend = db.q("SELECT COUNT(*) AS n FROM requests")[0]["n"]
     await message.reply_text(
         f"🛠 <b>Admin panel</b>\nWorkers: {len(db.servers())} · pending requests: {pend}\n"
-        f"TTS_API_KEY: {'set' if TTS_API_KEY else 'not set'}",
+        f"TTS_API_KEY: {'set' if TTS_API_KEY else 'not set'}\n\n"
+        "Commands: /addserver &lt;url&gt; · /servers · /users · /stats · /jobs",
         reply_markup=admin_keyboard())
 
 
@@ -2782,14 +2787,93 @@ async def back_main(client: Client, message: Message):
     await message.reply_text("Main menu", reply_markup=main_keyboard(message.from_user.id))
 
 
+ADD_SERVER_PROMPT = (
+    "➕ <b>Add Worker</b>\nSend the Worker URL, e.g. <code>https://edge-tts-worker.your-account.workers.dev</code>\n"
+    "(one per line / comma separated for several).\n"
+    "I will run a real synthesis test before adding it.  /cancel to abort.\n\n"
+    "Tip: <code>/addserver &lt;url&gt;</code> works from anywhere.")
+
+
+async def add_servers(message: Message, text: str) -> None:
+    """Probe every URL in ``text`` (health + real /tts) and register the good ones."""
+    if http_session is None:
+        await message.reply_text("Starting up, try again in a moment.")
+        return
+    urls: List[str] = []
+    for raw in re.split(r"[\s,]+", text):
+        nu = normalize_server_url(raw)
+        if nu and nu not in urls:
+            urls.append(nu)
+    if not urls:
+        await message.reply_text("❌ No valid URL found. Example: <code>https://name.account.workers.dev</code>")
+        return
+    status = await message.reply_text(f"🔍 Testing {len(urls)} Worker(s) (health + real synthesis)...")
+    out: List[str] = []
+    failed: List[str] = []
+    for u in urls:
+        info = await check_server(http_session, u, deep=True)
+        if info["ok"]:
+            added = db.add_server(u)
+            out.append(f"✅ {html.escape(short_server(u))} v{info.get('version') or '?'}"
+                       f" · {info.get('latency')}s · max_conc {info.get('max_concurrency', '?')}"
+                       + ("" if added else " (already registered)"))
+        else:
+            failed.append(u)
+            out.append(f"❌ {html.escape(short_server(u))}: {html.escape(info['error'] or 'unknown error')}")
+    pool.sync_from_db()
+    markup = None
+    if failed:
+        # let the admin force-register a Worker that is temporarily down / throttled
+        token = uuid.uuid4().hex[:8]
+        pending_servers[token] = (failed, time.time() + 900)
+        out.append("\nWorker failed the test. Check the URL / API key, or add it anyway (it will be retried "
+                   "automatically by the health loop).")
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add anyway", callback_data=f"addsrv:{token}"),
+                                        InlineKeyboardButton("✖️", callback_data="close")]])
+    n = len(db.servers())
+    out.append(f"\nRegistered Workers: <b>{n}</b>")
+    await safe_edit(status, "\n".join(out), reply_markup=markup)
+
+
 @bot.on_message(filters.regex(f"^{re.escape(BTN_ADD_SERVER)}$") & filters.private)
 async def btn_add_server(client: Client, message: Message):
     if not is_admin(message.from_user.id):
         return
     admin_states[message.from_user.id] = "add_server"
-    await message.reply_text(
-        "➕ Send the Worker URL, e.g. <code>https://edge-tts-worker.your-account.workers.dev</code>\n"
-        "(one per line for several). I will run a real synthesis test before adding it. /cancel to abort.")
+    await message.reply_text(ADD_SERVER_PROMPT, reply_markup=admin_keyboard())
+
+
+@bot.on_message(filters.command(["addserver", "add_server"]) & filters.private)
+async def cmd_add_server(client: Client, message: Message):
+    """/addserver <url> [<url> ...] - register Worker(s) directly (owner only)."""
+    if not is_admin(message.from_user.id):
+        return
+    arg = (message.text or "").split(None, 1)
+    if len(arg) < 2 or not arg[1].strip():
+        admin_states[message.from_user.id] = "add_server"
+        await message.reply_text(ADD_SERVER_PROMPT, reply_markup=admin_keyboard())
+        return
+    admin_states.pop(message.from_user.id, None)
+    await add_servers(message, arg[1])
+
+
+@bot.on_callback_query(filters.regex(r"^addsrv:"))
+async def cb_add_server_anyway(client: Client, cq: CallbackQuery):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("Owner only", show_alert=True)
+        return
+    token = cq.data.split(":", 1)[1]
+    entry = pending_servers.pop(token, None)
+    if not entry or entry[1] < time.time():
+        await cq.answer("Expired - send the URL again.", show_alert=True)
+        return
+    added = [u for u in entry[0] if db.add_server(u, note="added without passing the probe")]
+    pool.sync_from_db()
+    lines = [f"➕ Registered <code>{html.escape(u)}</code>" for u in added] or ["Already registered."]
+    lines.append(f"Registered Workers: <b>{len(db.servers())}</b> · use 🖥 Server Status to re-test.")
+    with contextlib.suppress(Exception):
+        await cq.message.edit_text("\n".join(lines))
+    await cq.answer("Added")
 
 
 @bot.on_message(filters.regex(f"^{re.escape(BTN_DEL_SERVER)}$") & filters.private)
@@ -2918,28 +3002,10 @@ async def btn_stats(client: Client, message: Message):
 async def _handle_admin_state(client: Client, message: Message, state: str, text: str) -> bool:
     uid = message.from_user.id
     if state == "add_server":
+        if text in ALL_BUTTONS:
+            return False  # admin pressed another button - let its handler run
         admin_states.pop(uid, None)
-        if http_session is None:
-            await message.reply_text("Starting up, try again in a moment.")
-            return True
-        urls = [normalize_server_url(u) for u in re.split(r"[\s,]+", text) if u.strip()]
-        urls = [u for u in urls if u]
-        if not urls:
-            await message.reply_text("❌ No valid URL found.")
-            return True
-        status = await message.reply_text(f"🔍 Testing {len(urls)} Worker(s)...")
-        out = []
-        for u in urls:
-            info = await check_server(http_session, u, deep=True)
-            if info["ok"]:
-                added = db.add_server(u)
-                out.append(f"✅ {html.escape(short_server(u))} v{info.get('version') or '?'}"
-                           f" · {info.get('latency')}s · max_conc {info.get('max_concurrency', '?')}"
-                           + ("" if added else " (already registered)"))
-            else:
-                out.append(f"❌ {html.escape(short_server(u))}: {html.escape(info['error'])}")
-        pool.sync_from_db()
-        await safe_edit(status, "\n".join(out))
+        await add_servers(message, text)
         return True
     if state == "approve":
         m = re.match(r"^\s*(\d{5,})\s*(\d+)?\s*$", text)
@@ -3020,6 +3086,9 @@ async def main() -> None:
     pool.sync_from_db()
     log.info("AudioBook Pro bot v%s starting - %d Worker(s), ffmpeg=%s, jobs dir=%s",
              VERSION, len(pool.states()), bool(FFMPEG), JOBS_DIR)
+    if asyncio.get_running_loop() is not getattr(bot, "loop", None):
+        # would make every handler silently dead - fail loudly instead
+        raise RuntimeError("event loop mismatch: bot.py must be run with LOOP.run_until_complete(main())")
     await bot.start()
     me = await bot.get_me()
     log.info("logged in as @%s", me.username)
@@ -3062,6 +3131,11 @@ async def main() -> None:
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        # Must be the same loop Pyrogram captured at Client() construction (see LOOP above).
+        LOOP.run_until_complete(main())
     except KeyboardInterrupt:
         pass
+    finally:
+        with contextlib.suppress(Exception):
+            LOOP.run_until_complete(LOOP.shutdown_asyncgens())
+        LOOP.close()
