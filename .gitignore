@@ -1,9 +1,8 @@
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-*.egg-info/
+# Node / Cloudflare Workers
+node_modules/
+.wrangler/
+.dev.vars
+npm-debug.log*
 
 # Secrets / env
 .env
@@ -11,13 +10,8 @@ venv/
 !.env.example
 
 # Runtime artefacts
-*.db
-*.db-journal
-*.session
-*.session-journal
 *.log
 *.log.*
-downloads/
 tmp/
 *.mp3
 

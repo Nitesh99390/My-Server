@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { DRM, TRUSTED_CLIENT_TOKEN, splitTextByByteLength, mkssml, parseHeaders, xmlEscape, Communicate } from "../src/edge_tts.js";
 import { validateParams, detectScript, voiceCanRead, normalizeText, buildSubtitles } from "../src/validate.js";
+import { splitPieces, mapLimit } from "../src/index.js";
 
 test("Sec-MS-GEC matches the reference Python algorithm", async () => {
   const token = await DRM.generateSecMsGec();
@@ -38,7 +39,7 @@ test("Communicate expands voice name", () => {
   assert.throws(() => new Communicate("x", "hi-IN-MadhurNeural", { rate: "fast" }));
 });
 
-test("validateParams mirrors app.py", () => {
+test("validateParams returns the stable 400 messages", () => {
   const opts = { maxTextLength: 6000, defaultVoice: "hi-IN-MadhurNeural" };
   assert.equal(validateParams({}, opts).error, "Field 'text' must be a string");
   assert.equal(validateParams({ text: "  " }, opts).error, "Field 'text' is required and cannot be empty");
@@ -69,6 +70,38 @@ test("buildSubtitles", () => {
   ]);
   assert.match(srt, /^1\n00:00:00,000 --> 00:00:01,000\nHello world\.\n\n2\n/);
   assert.match(vtt, /^WEBVTT\n\n00:00:00\.000 --> 00:00:01\.000\nHello world\./);
+});
+
+test("splitPieces keeps every piece under the byte limit and loses no words", () => {
+  const hindi = "यह एक लंबा परीक्षण वाक्य है जिसे कई टुकड़ों में बांटा जाएगा। ".repeat(60);
+  const pieces = splitPieces(hindi, 3800);
+  assert.ok(pieces.length >= 3, `expected >=3 pieces, got ${pieces.length}`);
+  for (const p of pieces) assert.ok(Buffer.byteLength(p) <= 3800, "piece too big");
+  assert.equal(pieces.join(" ").replace(/\s+/g, " ").trim(), hindi.replace(/\s+/g, " ").trim());
+  assert.deepEqual(splitPieces("short", 3800), ["short"]);
+  assert.deepEqual(splitPieces("   ", 3800), ["   "]);
+});
+
+test("mapLimit preserves order, honours the limit and propagates the first error", async () => {
+  let inFlight = 0;
+  let peak = 0;
+  const order = await mapLimit([5, 1, 4, 2, 3], 2, async (ms, i) => {
+    inFlight += 1;
+    peak = Math.max(peak, inFlight);
+    await new Promise((r) => setTimeout(r, ms * 5));
+    inFlight -= 1;
+    return `${i}:${ms}`;
+  });
+  assert.deepEqual(order, ["0:5", "1:1", "2:4", "3:2", "4:3"]);
+  assert.ok(peak <= 2 && peak >= 2, `peak in-flight was ${peak}`);
+  assert.deepEqual(await mapLimit([], 4, async () => 1), []);
+  await assert.rejects(
+    mapLimit([1, 2, 3], 3, async (n) => {
+      if (n === 2) throw new Error("boom");
+      return n;
+    }),
+    /boom/,
+  );
 });
 
 // Live test against Microsoft's endpoint (skipped without network / when EDGE_TTS_LIVE=0).

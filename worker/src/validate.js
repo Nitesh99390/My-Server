@@ -1,7 +1,7 @@
 /**
  * validate.js - request validation, text normalisation and script detection.
- * Port of the corresponding helpers in app.py (v4.1.1) so the Worker returns
- * the exact same 400 messages the bot already understands.
+ * The 400 messages are stable API: the bot pattern-matches on them to decide
+ * whether to retry, switch voice or give up.
  */
 
 export const RATE_RE = /^[+-]\d{1,3}%$/;

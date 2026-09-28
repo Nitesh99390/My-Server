@@ -2,9 +2,9 @@
  * =============================================================================
  *  Edge-TTS Render Server - Cloudflare Worker edition   (v5.0.0-cf)
  * =============================================================================
- *  The TTS engine behind the AudioBook Pro Telegram bot (bot.py).  Every
- *  request is independent: the Worker fans a long text out into several
- *  parallel Edge websocket connections and returns one MP3.
+ *  The TTS engine behind the AudioBook Pro Telegram bot.  Every request is
+ *  independent: the Worker fans a long text out into several parallel Edge
+ *  websocket connections and returns one MP3.
  *
  *  Endpoints
  *  ---------
@@ -21,7 +21,8 @@
  *  Environment (wrangler.toml [vars] / secrets)
  *  --------------------------------------------
  *    API_KEY (secret)  MAX_TEXT_LENGTH  MAX_CONCURRENCY  DEFAULT_VOICE
- *    TTS_RETRIES  ATTEMPT_TIMEOUT  ENABLE_CORS  CACHE_TTL
+ *    TTS_RETRIES  ATTEMPT_TIMEOUT  SYNTH_TIMEOUT  ENABLE_CORS  CACHE_TTL
+ *    PIECE_BYTES  PIECE_PARALLELISM
  * =============================================================================
  */
 
@@ -31,9 +32,10 @@ import { buildSubtitles, validateParams } from "./validate.js";
 const VERSION = "5.0.0-cf";
 // Edge accepts ~4096 bytes of escaped text per websocket message.  Split the
 // raw text a little below that (escaping adds a few bytes) so every piece is
-// exactly one connection, then run the pieces in parallel.
-const PIECE_BYTES = 3800;
-const PIECE_PARALLELISM = 4;
+// exactly one connection, then run the pieces in parallel.  Both are tunable
+// from wrangler.toml [vars] (PIECE_BYTES / PIECE_PARALLELISM).
+const DEFAULT_PIECE_BYTES = 3800;
+const DEFAULT_PIECE_PARALLELISM = 4;
 const VOICE_CACHE_TTL_MS = 6 * 3600 * 1000;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 // Date.now() is frozen at 0 in the Worker global scope; initialise lazily on the first request.
@@ -68,6 +70,9 @@ function config(env) {
     synthTimeout: Math.max(5, envInt(env, "SYNTH_TIMEOUT", 110)),
     cors: envBool(env, "ENABLE_CORS", true),
     cacheTtl: Math.max(0, envInt(env, "CACHE_TTL", 3600)),
+    // Never above 4000: Edge rejects websocket messages over ~4096 escaped bytes.
+    pieceBytes: Math.max(500, Math.min(envInt(env, "PIECE_BYTES", DEFAULT_PIECE_BYTES), 4000)),
+    pieceParallelism: Math.max(1, Math.min(envInt(env, "PIECE_PARALLELISM", DEFAULT_PIECE_PARALLELISM), 8)),
   };
 }
 
@@ -233,7 +238,7 @@ function withTimeout(promise, ms, message, onTimeout) {
 }
 
 /** Run `fn` over `items` with at most `limit` in flight; results keep input order. */
-async function mapLimit(items, limit, fn) {
+export async function mapLimit(items, limit, fn) {
   const results = new Array(items.length);
   let next = 0;
   let failed = null;
@@ -252,8 +257,8 @@ async function mapLimit(items, limit, fn) {
   return results;
 }
 
-function splitPieces(text) {
-  const pieces = [...splitTextByByteLength(text, PIECE_BYTES)];
+export function splitPieces(text, pieceBytes = DEFAULT_PIECE_BYTES) {
+  const pieces = [...splitTextByByteLength(text, pieceBytes)];
   return pieces.length ? pieces : [text];
 }
 
@@ -304,8 +309,8 @@ async function streamPiece(text, params, collectWords, timeoutMs) {
  */
 async function synthesize(params, cfg, collectWords = false) {
   const deadline = Date.now() + (cfg.synthTimeout - 2) * 1000;
-  const pieces = splitPieces(params.text);
-  const pieceParallelism = collectWords ? 1 : PIECE_PARALLELISM; // word offsets must stay sequential
+  const pieces = splitPieces(params.text, cfg.pieceBytes);
+  const pieceParallelism = collectWords ? 1 : cfg.pieceParallelism; // word offsets must stay sequential
 
   const onePiece = async (text) => {
     let lastErr = null;
@@ -486,8 +491,8 @@ function health(cfg) {
     free_slots: Math.max(0, cfg.maxConcurrency - runner.active),
     queued: 0,
     min_start_gap_ms: 0,
-    piece_bytes: PIECE_BYTES,
-    piece_parallelism: PIECE_PARALLELISM,
+    piece_bytes: cfg.pieceBytes,
+    piece_parallelism: cfg.pieceParallelism,
     throttled: runner.throttled,
     throttle_events: runner.throttleEvents,
     auth_required: Boolean(cfg.apiKey),
