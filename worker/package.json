@@ -1,6 +1,6 @@
 {
   "name": "edge-tts-worker",
-  "version": "4.1.1",
+  "version": "5.0.0",
   "private": true,
   "description": "Cloudflare Worker port of the AudioBook Pro Edge-TTS render server (app.py)",
   "type": "module",

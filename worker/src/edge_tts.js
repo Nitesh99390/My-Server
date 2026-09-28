@@ -465,7 +465,22 @@ export class Communicate {
       chunkAudioBytes: 0,
       cumulativeAudioBytes: 0,
       streamWasCalled: false,
+      aborted: false,
+      ws: null,
     };
+  }
+
+  /** Close the live websocket (if any) and stop the stream - used on timeouts. */
+  abort() {
+    this.state.aborted = true;
+    const ws = this.state.ws;
+    if (ws) {
+      try {
+        ws.close(1000, "aborted");
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   #parseMetadata(text) {
@@ -499,14 +514,26 @@ export class Communicate {
       `${WSS_URL}&ConnectionId=${connectId()}` +
       `&Sec-MS-GEC=${await DRM.generateSecMsGec()}` +
       `&Sec-MS-GEC-Version=${SEC_MS_GEC_VERSION}`;
+    if (this.state.aborted) throw new WebSocketError("aborted");
     const ws = await openWebSocket(url, DRM.headersWithMuid(WSS_HEADERS), this.connectTimeoutMs);
+    this.state.ws = ws;
+    if (this.state.aborted) {
+      try {
+        ws.close(1000, "aborted");
+      } catch {
+        /* ignore */
+      }
+      throw new WebSocketError("aborted");
+    }
     let audioWasReceived = false;
     let receiveTimer = null;
+    let receiveTimedOut = false;
     const messages = messageIterator(ws);
 
     const armReceiveTimeout = () => {
       if (receiveTimer) clearTimeout(receiveTimer);
       receiveTimer = setTimeout(() => {
+        receiveTimedOut = true;
         try {
           ws.close(1000, "receive timeout");
         } catch {
@@ -575,11 +602,15 @@ export class Communicate {
           yield { type: "audio", data: audio.slice() };
         }
       }
+      if (receiveTimedOut) throw new WebSocketError("No data from Edge for " + this.receiveTimeoutMs / 1000 + "s (receive timeout)");
+      if (this.state.aborted) throw new WebSocketError("aborted");
       if (!turnEnded && !audioWasReceived) {
         throw new NoAudioReceived();
       }
+      if (!turnEnded) throw new WebSocketError("Connection closed before turn.end (partial audio discarded)");
     } finally {
       if (receiveTimer) clearTimeout(receiveTimer);
+      this.state.ws = null;
       try {
         ws.close(1000, "done");
       } catch {
