@@ -22,17 +22,21 @@ MAX_TEXT_LENGTH = "6000"
 # Slots the Worker *advertises* to the bot on /health.  Each Worker request is
 # independent, so this is the bot-side per-server ceiling (its limiter never
 # exceeds max_concurrency), not a hard cap inside the Worker.
-MAX_CONCURRENCY = "6"
+MAX_CONCURRENCY = "4"
 DEFAULT_VOICE = "hi-IN-MadhurNeural"
-# Per-piece retries and per-attempt timeout (seconds).
-TTS_RETRIES = "2"
-ATTEMPT_TIMEOUT = "45"
+# Per-piece retries and per-attempt timeout (seconds).  Transient errors are
+# retried quickly; a real 403/429 from Microsoft is retried at most once and
+# then reported as 503 kind=throttle so the bot moves on to another Worker.
+TTS_RETRIES = "3"
+ATTEMPT_TIMEOUT = "40"
 # Whole-request budget (seconds) - keep below the bot's chunk timeout (150 s).
 SYNTH_TIMEOUT = "110"
 # Long text is split into pieces of at most PIECE_BYTES (<= 4000; one Edge
 # websocket each) and synthesised PIECE_PARALLELISM pieces at a time.
 PIECE_BYTES = "3800"
-PIECE_PARALLELISM = "4"
+# With a fleet of many Workers each one only needs to be gentle: 2 parallel
+# websockets per request keeps a single Worker far below Microsoft's radar.
+PIECE_PARALLELISM = "2"
 ENABLE_CORS = "true"
 # Cache synthesised audio in Cloudflare's edge cache (seconds; 0 = disabled).
 CACHE_TTL = "3600"

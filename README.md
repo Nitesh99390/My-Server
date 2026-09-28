@@ -14,7 +14,53 @@ Telegram user  ->  bot.py  (master, your Oracle VPS)  --HTTP-->  worker/  (Cloud
 | **TTS Worker** - turns text into MP3 (48 kbit/s CBR) with Edge neural voices | Cloudflare Workers | `worker/` |
 
 The bot never talks to Microsoft itself, so the VPS IP can never be throttled.
-Add more Workers (Admin Panel -> Add Server) for more throughput.
+
+## Fleet mode - why 100 Workers beat 1 Worker
+
+Microsoft's free Edge endpoint rate-limits **per egress** (= per Cloudflare
+account / Worker).  Squeezing one Worker with 8 parallel requests gets it a
+`403` within minutes and the job pauses.  The design since v5.2 is the
+opposite: **many Workers, each with a tiny, steady load**.
+
+| | 1 Worker | 100 Workers (free accounts) |
+| --- | --- | --- |
+| parallel chunks | 4-8 (throttled fast) | 200 (2 per Worker) - nothing is ever "hot" |
+| 20 MB EPUB (~7 M chars) | many hours, keeps pausing | **~15-25 min** |
+| one Worker throttled | the whole job pauses | that Worker sits out 30 s, the other 99 continue |
+
+What the code does to make a fleet safe:
+
+- **Worker** answers `503 kind=throttle` **only** for a real `403/429` from
+  Microsoft and `502 kind=transient` for timeouts / resets / empty audio.  A
+  throttled request is not retried on the same Worker more than once.
+- **Bot** benches a Worker only on `kind=throttle` (30 s -> 1 m -> 2 m -> 4 m,
+  the level decays with clean chunks *and* with time).  Transient errors just
+  move the chunk to another Worker; a Worker is benched for those only after
+  `SOFT_FAIL_LIMIT` of them inside `SOFT_FAIL_WINDOW`.
+- **Least-loaded + least-recently-used** scheduling rotates evenly through the
+  whole fleet instead of hammering the fastest few Workers.
+- Defaults: 2 requests per Worker (max 3), 250 ms gap, 2 000-char chunks,
+  160 total in flight (`MAX_TOTAL_CONCURRENCY` - raise it with the fleet size).
+
+### Deploying the fleet
+
+```bash
+cd worker && npm install
+# accounts.txt - one Cloudflare account per line:  <API_TOKEN> <ACCOUNT_ID> [<worker-name>]
+#   token: My Profile -> API Tokens -> Create -> "Edit Cloudflare Workers"
+#   account id: Workers & Pages -> Overview (right sidebar)
+TTS_API_KEY=optional-shared-key PARALLEL=8 ./deploy-fleet.sh accounts.txt
+# -> fleet-urls.txt  (one URL per line)   fleet-failed.txt (re-run with it)
+```
+
+Then in Telegram: **🛠 Admin -> 🖥 Workers -> ➕ Add** and *upload
+`fleet-urls.txt`* (or paste any number of URLs).  The bot probes them
+`HEALTH_PARALLELISM` at a time (`/health` + a real `/tts`), registers the good
+ones and lists the failures with an **Add anyway** button.  The Workers page
+shows a fleet summary (healthy / benched / down, requests in flight) with a
+paged list, **🗑 Remove** (paged) and **🧹 Remove all failing**.
+
+`accounts.txt` and `fleet-*.txt` are git-ignored (they contain tokens).
 
 ## 1. Bot on the Oracle VPS (`bot.py`)
 
@@ -72,26 +118,38 @@ one-tap approve, approve/revoke by id), Jobs (with kill buttons), Stats,
 Broadcast (with progress).
 
 Every chunk is checkpointed under `JOBS_DIR`, so a restart resumes the job;
-delivered parts are never sent twice.  A Worker that Microsoft throttles is
-benched alone (1 -> 2 -> 5 -> 10 min) while the job continues on the others;
-the job only pauses (never dies) when every Worker is out.
+delivered parts are never sent twice.  A Worker that Microsoft really
+rate-limits is benched alone (30 s -> 1 -> 2 -> 4 min) while the job continues
+on the others; transient hiccups never bench anything.  The job only pauses
+(never dies) when every Worker is out, and while paused it re-probes just the
+troubled Workers.
 
-### Adding a Worker from Telegram
+### Adding Workers from Telegram
 
-1. `🛠 Admin` -> **🖥 Workers** -> **➕ Add** -> paste the Worker URL
-   (`https://<name>.<account>.workers.dev`, several per message allowed), or
-2. `/addserver https://<name>.<account>.workers.dev` from anywhere.
+1. `🛠 Admin` -> **🖥 Workers** -> **➕ Add** -> paste Worker URLs
+   (`https://<name>.<account>.workers.dev`, any number, one per line) **or
+   upload a `.txt` file** with one URL per line (`fleet-urls.txt`), or
+2. `/addserver <url> [<url> ...]` from anywhere.
 
-The bot calls `/health` and does a real `/tts` synthesis before registering.
-If the test fails you get the reason (wrong URL, API key missing, throttled...)
-and an **➕ Add anyway** button; the health loop re-tests it every few minutes.
-**🔄 Test all** / `/servers` re-probes all registered Workers.
+The bot calls `/health` and does a real `/tts` synthesis on every URL (in
+parallel, with a live counter) before registering it.  Failures are listed
+with the reason (wrong URL, API key missing, throttled...) and an **➕ Add
+anyway** button; the health loop re-tests them every few minutes.
+**🔄 Test all** / `/servers` re-probes the whole fleet.
 
 ### API key is optional
 
 `TTS_API_KEY` may stay empty.  Only if you ran `wrangler secret put API_KEY` on
 the Worker do you need the same value on the bot; the Worker test tells you
 exactly that if they do not match.  You can add it to `.env` later and restart.
+
+### Upgrading from bot.py 5.0 / 5.1 to 5.2
+
+Replace `bot.py`, review the new fleet defaults in `.env.example`
+(`PER_SERVER_CONCURRENCY=2`, `MAX_TOTAL_CONCURRENCY=160`, shorter
+`QUARANTINE_STEPS`...) and redeploy the Worker (`5.2.0-cf`) - old Workers keep
+working, but only the new one reports `kind=throttle|transient`, which is what
+stops healthy Workers from being benched after a single timeout.
 
 ### Upgrading from bot.py 4.x
 
@@ -200,9 +258,13 @@ curl -s -X POST https://<worker>/tts \
 2. The text is split into pieces of at most `PIECE_BYTES` (default 3800 - Edge
    accepts ~4096 escaped bytes per websocket message), each piece being exactly
    one websocket connection.
-3. Up to `PIECE_PARALLELISM` pieces (default 4) are synthesised concurrently;
-   each piece has its own retries (`TTS_RETRIES`) and per-attempt timeout
+3. Up to `PIECE_PARALLELISM` pieces (default 2 - gentle per Worker, the fleet
+   provides the parallelism) are synthesised concurrently; each piece has its
+   own retries (`TTS_RETRIES`, default 3) and per-attempt timeout
    (`ATTEMPT_TIMEOUT`). A timed-out attempt closes its websocket immediately.
+   Only a real `403/429` from Microsoft counts as throttling; it is retried at
+   most once on this Worker and then reported as `503 kind=throttle` so the bot
+   moves the chunk elsewhere.  Every other failure is `502 kind=transient`.
 4. MP3 frames are concatenated in order. Because the stream is CBR 48 kbit/s the
    duration is derived from the byte size (6 bytes per millisecond).
 5. Results are cached in Cloudflare's edge cache for `CACHE_TTL` seconds keyed
@@ -213,37 +275,39 @@ monotonic.
 
 There is **no global cooldown**: a Worker has no fixed egress IP, so a `403`
 from Microsoft on one request must not slow down the next. Throttle counters
-on `/health` are informational only.
+on `/health` (`throttled`, `throttle_events`, `last_throttle_ago_s`) are
+informational only.
 
 ## Configuration (`wrangler.toml` `[vars]`)
 
 | Var | Default | Meaning |
 | --- | --- | --- |
 | `MAX_TEXT_LENGTH` | `6000` | max characters per request |
-| `MAX_CONCURRENCY` | `6` | slots advertised to the bot on `/health` (bot-side ceiling) |
+| `MAX_CONCURRENCY` | `4` | slots advertised to the bot on `/health` (bot-side ceiling) |
 | `DEFAULT_VOICE` | `hi-IN-MadhurNeural` | used when `voice` is omitted |
-| `TTS_RETRIES` | `2` | attempts per piece |
-| `ATTEMPT_TIMEOUT` | `45` | seconds per attempt |
+| `TTS_RETRIES` | `3` | attempts per piece (a real 403 stops after the 2nd) |
+| `ATTEMPT_TIMEOUT` | `40` | seconds per attempt |
 | `SYNTH_TIMEOUT` | `110` | whole-request budget in seconds (keep below the bot's 150 s chunk timeout) |
 | `PIECE_BYTES` | `3800` | max bytes per piece (clamped to 500..4000) |
-| `PIECE_PARALLELISM` | `4` | pieces synthesised concurrently (1..8) |
+| `PIECE_PARALLELISM` | `2` | pieces synthesised concurrently (1..8) |
 | `ENABLE_CORS` | `true` | add CORS headers |
 | `CACHE_TTL` | `3600` | edge cache TTL in seconds (`0` disables) |
 | `API_KEY` | - | **secret** (`wrangler secret put API_KEY`), never in `[vars]` |
 
 ## Error responses
 
-All errors are JSON: `{"error": "...", "status": <code>, "request_id": "..."}`.
+All errors are JSON: `{"error": "...", "status": <code>, "request_id": "...", "kind"?: "throttle"|"transient"}`
+(`kind` is also sent as the `X-Error-Kind` header).
 
-| Status | When |
-| --- | --- |
-| 400 | invalid/missing field, voice cannot read the text's script |
-| 401 | bad or missing API key |
-| 413 | body larger than 2 MB |
-| 502 | Edge failed after all retries |
-| 503 | Microsoft throttled the Worker (`Retry-After` set) |
-| 504 | synthesis exceeded `SYNTH_TIMEOUT` |
+| Status | kind | When |
+| --- | --- | --- |
+| 400 | | invalid/missing field, voice cannot read the text's script |
+| 401 | | bad or missing API key |
+| 413 | | body larger than 2 MB |
+| 502 | `transient` | Edge failed after all retries for a non-rate-limit reason (timeout, reset, no audio) - retry on another Worker |
+| 503 | `throttle` | Microsoft answered `403/429` - bench this Worker for `Retry-After` seconds |
+| 504 | | synthesis exceeded `SYNTH_TIMEOUT` |
 
 ## Version
 
-Worker `5.0.0-cf` - see `X-Server-Version` or `GET /health`.
+Worker `5.2.0-cf` - see `X-Server-Version` or `GET /health`.

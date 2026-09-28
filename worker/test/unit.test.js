@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { DRM, TRUSTED_CLIENT_TOKEN, splitTextByByteLength, mkssml, parseHeaders, xmlEscape, Communicate } from "../src/edge_tts.js";
 import { validateParams, detectScript, voiceCanRead, normalizeText, buildSubtitles } from "../src/validate.js";
-import { splitPieces, mapLimit } from "../src/index.js";
+import { splitPieces, mapLimit, looksThrottled, classifyError } from "../src/index.js";
+import { WSServerHandshakeError, WebSocketError, NoAudioReceived } from "../src/edge_tts.js";
 
 test("Sec-MS-GEC matches the reference Python algorithm", async () => {
   const token = await DRM.generateSecMsGec();
@@ -119,4 +120,20 @@ test("live synthesis via Edge-TTS (needs network)", { skip: process.env.EDGE_TTS
   assert.ok(bytes > 1000, "got audio");
   assert.ok(words > 0, "got word boundaries");
   assert.ok(first[0] === 0xff && (first[1] & 0xe0) === 0xe0, "MPEG frame sync");
+});
+
+test("looksThrottled: only real 403/429 rate limits count, transient network errors do not", () => {
+  assert.equal(looksThrottled(new WSServerHandshakeError(403)), true);
+  assert.equal(looksThrottled(new WSServerHandshakeError(429)), true);
+  assert.equal(looksThrottled(new Error("HTTP 429 Too Many Requests")), true);
+  assert.equal(looksThrottled(new Error("microsoft is throttling")), true);
+  // these used to bench a whole Worker for minutes:
+  assert.equal(looksThrottled(new WSServerHandshakeError(0, "ClientConnectorError: connect timeout")), false);
+  assert.equal(looksThrottled(new WSServerHandshakeError(502)), false);
+  assert.equal(looksThrottled(new WebSocketError("Connection closed before turn.end (partial audio discarded)")), false);
+  assert.equal(looksThrottled(new WebSocketError("No data from Edge for 30s (receive timeout)")), false);
+  assert.equal(looksThrottled(new NoAudioReceived()), false);
+  assert.equal(looksThrottled(null), false);
+  assert.equal(classifyError(new WSServerHandshakeError(403)), "throttle");
+  assert.equal(classifyError(new NoAudioReceived()), "transient");
 });
