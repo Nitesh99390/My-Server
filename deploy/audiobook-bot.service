@@ -1,0 +1,23 @@
+# systemd unit for the Telegram master bot on an Oracle Cloud VPS (Ubuntu).
+#   sudo cp deploy/audiobook-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now audiobook-bot
+#   journalctl -u audiobook-bot -f
+# Adjust User / paths if you did not install into /home/ubuntu/audiobook.
+[Unit]
+Description=AudioBook Pro Telegram bot (TTS via Cloudflare Worker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/audiobook
+ExecStart=/home/ubuntu/audiobook/venv/bin/python /home/ubuntu/audiobook/bot.py
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

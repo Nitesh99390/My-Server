@@ -1,19 +1,53 @@
-# Edge-TTS Render Server (Cloudflare Worker)
+# AudioBook Pro - Telegram bot (VPS) + Edge-TTS Worker (Cloudflare)
 
-The text-to-speech engine behind **AudioBook Pro**. It runs entirely on
-Cloudflare Workers - no Python, no VMs, no cold starts - and turns text into a
-single MP3 (48 kbit/s CBR, 24 kHz mono) using Microsoft Edge's neural voices.
-
-Everything lives in [`worker/`](worker/).
+Convert novels, stories and documents (`.txt .md .docx .html .epub .pdf` or plain
+messages) into MP3 audiobooks from Telegram using Microsoft Edge neural voices.
 
 ```
-worker/
-├── src/index.js      HTTP routes, parallel piece synthesis, caching, auth
-├── src/edge_tts.js   JS port of edge-tts 7.2.8 (DRM token, websocket protocol)
-├── src/validate.js   request validation, text normalisation, script detection
-├── test/unit.test.js node --test suite (incl. one live Edge-TTS call)
-└── wrangler.toml     deployment config + tunables
+Telegram user  ->  bot.py  (master, your Oracle VPS)  --HTTP-->  worker/  (Cloudflare Worker)
+                                                      <--MP3---   Edge-TTS engine
 ```
+
+| Part | Where it runs | File(s) |
+| --- | --- | --- |
+| **Master bot** - Telegram UI, text extraction, chunk planning, multi-Worker load balancing, part splitting, uploads, users/admin | your VPS (Oracle free tier is enough) | `bot.py` (single file), `requirements-bot.txt`, `.env.example`, `deploy/` |
+| **TTS Worker** - turns text into MP3 (48 kbit/s CBR) with Edge neural voices | Cloudflare Workers | `worker/` |
+
+The bot never talks to Microsoft itself, so the VPS IP can never be throttled.
+Add more Workers (Admin Panel -> Add Server) for more throughput.
+
+## 1. Bot on the Oracle VPS (`bot.py`)
+
+```bash
+sudo apt update && sudo apt install -y python3-venv ffmpeg
+mkdir -p ~/audiobook && cd ~/audiobook
+# copy bot.py, requirements-bot.txt and .env.example here (git clone / scp / curl raw)
+python3 -m venv venv && . venv/bin/activate
+pip install -r requirements-bot.txt
+cp .env.example .env && nano .env      # API_ID, API_HASH, BOT_TOKEN, OWNER_ID, TTS_SERVERS, TTS_API_KEY
+python bot.py
+```
+
+Run it as a service (auto-restart, survives reboots):
+
+```bash
+sudo cp deploy/audiobook-bot.service /etc/systemd/system/   # edit User/paths if needed
+sudo systemctl daemon-reload && sudo systemctl enable --now audiobook-bot
+journalctl -u audiobook-bot -f
+```
+
+`deploy/install-oracle.sh` does the apt/venv/pip steps for you.
+
+Bot features: approval-based users, `/settings` (voice, rate, pitch, volume, hours
+per part, chapter split), `/preview`, `/cancel`, `/queue`, `/resume`, `/history`,
+admin panel (`/admin`: add/remove Workers with a live synthesis test, `/servers`,
+approve/revoke/ban, `/users`, broadcast, `/stats`, `/jobs`).  Every chunk is
+checkpointed under `JOBS_DIR`, so a restart resumes the job; delivered parts are
+never sent twice.  A Worker that Microsoft throttles is benched alone
+(1 -> 2 -> 5 -> 10 min) while the job continues on the others; the job only
+pauses (never dies) when every Worker is out.
+
+## 2. TTS Worker on Cloudflare (`worker/`)
 
 ## Quick start
 
@@ -25,8 +59,8 @@ npx wrangler secret put API_KEY        # optional - same value the bot sends as 
 npx wrangler deploy
 ```
 
-Then register `https://<name>.<account>.workers.dev` in the bot
-(Admin Panel -> Add Server).
+Then put `https://<name>.<account>.workers.dev` in the bot's `TTS_SERVERS`
+(or Admin Panel -> Add Server) and the same `API_KEY` value in `TTS_API_KEY`.
 
 ## CI / auto-deploy (GitHub Actions)
 
