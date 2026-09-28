@@ -24,8 +24,8 @@ MAX_TEXT_LENGTH = "6000"
 # exceeds max_concurrency), not a hard cap inside the Worker.
 MAX_CONCURRENCY = "6"
 DEFAULT_VOICE = "hi-IN-MadhurNeural"
-TTS_RETRIES = "3"
-ATTEMPT_TIMEOUT = "75"
+TTS_RETRIES = "2"
+ATTEMPT_TIMEOUT = "45"
 ENABLE_CORS = "true"
 # Cache synthesised audio in Cloudflare's edge cache (seconds; 0 = disabled).
 CACHE_TTL = "3600"

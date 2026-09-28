@@ -1,9 +1,10 @@
 /**
  * =============================================================================
- *  Edge-TTS Render Server - Cloudflare Worker edition   (v4.1.1-cf)
+ *  Edge-TTS Render Server - Cloudflare Worker edition   (v5.0.0-cf)
  * =============================================================================
- *  Drop-in replacement for app.py: the Telegram bot (bot.py) talks to it with
- *  exactly the same endpoints, payloads, headers and status codes.
+ *  The TTS engine behind the AudioBook Pro Telegram bot (bot.py).  Every
+ *  request is independent: the Worker fans a long text out into several
+ *  parallel Edge websocket connections and returns one MP3.
  *
  *  Endpoints
  *  ---------
@@ -24,10 +25,15 @@
  * =============================================================================
  */
 
-import { Communicate, listVoices } from "./edge_tts.js";
+import { Communicate, listVoices, splitTextByByteLength } from "./edge_tts.js";
 import { buildSubtitles, validateParams } from "./validate.js";
 
-const VERSION = "4.1.1-cf";
+const VERSION = "5.0.0-cf";
+// Edge accepts ~4096 bytes of escaped text per websocket message.  Split the
+// raw text a little below that (escaping adds a few bytes) so every piece is
+// exactly one connection, then run the pieces in parallel.
+const PIECE_BYTES = 3800;
+const PIECE_PARALLELISM = 4;
 const VOICE_CACHE_TTL_MS = 6 * 3600 * 1000;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 // Date.now() is frozen at 0 in the Worker global scope; initialise lazily on the first request.
@@ -56,10 +62,10 @@ function config(env) {
     maxTextLength: Math.max(1, envInt(env, "MAX_TEXT_LENGTH", 6000)),
     maxConcurrency: Math.max(1, Math.min(envInt(env, "MAX_CONCURRENCY", 6), 8)),
     defaultVoice: (env?.DEFAULT_VOICE || "hi-IN-MadhurNeural").trim(),
-    retries: Math.max(1, envInt(env, "TTS_RETRIES", 3)),
-    attemptTimeout: Math.max(10, envInt(env, "ATTEMPT_TIMEOUT", 75)),
-    // Whole-request budget; keep below the bot's CHUNK_TIMEOUT (240 s).
-    synthTimeout: Math.max(5, envInt(env, "SYNTH_TIMEOUT", 200)),
+    retries: Math.max(1, envInt(env, "TTS_RETRIES", 2)),
+    attemptTimeout: Math.max(10, envInt(env, "ATTEMPT_TIMEOUT", 45)),
+    // Whole-request budget; keep below the bot's CHUNK_TIMEOUT (150 s).
+    synthTimeout: Math.max(5, envInt(env, "SYNTH_TIMEOUT", 110)),
     cors: envBool(env, "ENABLE_CORS", true),
     cacheTtl: Math.max(0, envInt(env, "CACHE_TTL", 3600)),
   };
@@ -109,23 +115,22 @@ const stats = {
   },
 };
 
+// Per-isolate throttle bookkeeping.  Purely informational (exposed on /health):
+// a Cloudflare Worker has no fixed egress IP, so one 403 must never slow down
+// the *next* request - the old global cooldown did exactly that.
 const runner = {
   active: 0,
   throttleEvents: 0,
-  cooldownUntil: 0,
   lastThrottleAt: 0,
   noteThrottle() {
     this.throttleEvents += 1;
     this.lastThrottleAt = Date.now();
-    const pause = Math.min(20, 1.5 * this.throttleEvents);
-    this.cooldownUntil = Math.max(this.cooldownUntil, Date.now() + pause * 1000);
-    return pause;
   },
   noteSuccess() {
-    if (this.throttleEvents && Date.now() > this.cooldownUntil + 60_000) this.throttleEvents = 0;
+    if (this.throttleEvents && Date.now() - this.lastThrottleAt > 120_000) this.throttleEvents = 0;
   },
   get throttled() {
-    return Date.now() < this.cooldownUntil || (this.throttleEvents >= 3 && Date.now() - this.lastThrottleAt < 120_000);
+    return this.throttleEvents >= 3 && Date.now() - this.lastThrottleAt < 60_000;
   },
 };
 
@@ -212,82 +217,145 @@ function looksThrottled(err) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function withTimeout(promise, ms, message) {
+function withTimeout(promise, ms, message, onTimeout) {
   let timer;
   const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new HttpError(504, message)), ms);
+    timer = setTimeout(() => {
+      try {
+        onTimeout?.();
+      } catch {
+        /* ignore */
+      }
+      reject(new HttpError(504, message));
+    }, ms);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** Run `fn` over `items` with at most `limit` in flight; results keep input order. */
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  let failed = null;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length && !failed) {
+      const i = next++;
+      try {
+        results[i] = await fn(items[i], i);
+      } catch (err) {
+        failed = failed || err;
+      }
+    }
+  });
+  await Promise.all(workers);
+  if (failed) throw failed;
+  return results;
+}
+
+function splitPieces(text) {
+  const pieces = [...splitTextByByteLength(text, PIECE_BYTES)];
+  return pieces.length ? pieces : [text];
 }
 
 // ---------------------------------------------------------------------------
 // Core synthesis
 // ---------------------------------------------------------------------------
-async function synthesizeOnce(params, collectWords) {
-  const communicate = new Communicate(params.text, params.voice, {
+/** One websocket round-trip for one piece of text (<= ~4 KB escaped). */
+async function streamPiece(text, params, collectWords, timeoutMs) {
+  const communicate = new Communicate(text, params.voice, {
     rate: params.rate,
     pitch: params.pitch,
     volume: params.volume,
-    boundary: "WordBoundary",
+    boundary: collectWords ? "WordBoundary" : "SentenceBoundary",
+    connectTimeout: 10,
+    receiveTimeout: 30,
   });
-  const parts = [];
-  let total = 0;
-  let durationMs = 0;
-  const words = [];
-  for await (const chunk of communicate.stream()) {
-    if (chunk.type === "audio") {
-      parts.push(chunk.data);
-      total += chunk.data.length;
-    } else if (chunk.type === "WordBoundary" || chunk.type === "SentenceBoundary") {
-      const start = chunk.offset / 10_000;
-      const dur = chunk.duration / 10_000;
-      durationMs = Math.max(durationMs, Math.trunc(start + dur));
-      if (collectWords) words.push({ text: chunk.text, start_ms: Math.trunc(start), end_ms: Math.trunc(start + dur) });
+  const run = (async () => {
+    const parts = [];
+    let total = 0;
+    let durationMs = 0;
+    const words = [];
+    for await (const chunk of communicate.stream()) {
+      if (chunk.type === "audio") {
+        parts.push(chunk.data);
+        total += chunk.data.length;
+      } else if (chunk.type === "WordBoundary" || chunk.type === "SentenceBoundary") {
+        const start = chunk.offset / 10_000;
+        const dur = chunk.duration / 10_000;
+        durationMs = Math.max(durationMs, Math.trunc(start + dur));
+        if (collectWords) words.push({ text: chunk.text, start_ms: Math.trunc(start), end_ms: Math.trunc(start + dur) });
+      }
     }
-  }
-  if (!total) {
-    const e = new Error("Empty audio stream");
-    e.name = "NoAudioReceived";
-    throw e;
-  }
-  const audio = new Uint8Array(total);
-  let off = 0;
-  for (const p of parts) {
-    audio.set(p, off);
-    off += p.length;
-  }
-  return { audio, durationMs, words };
+    if (!total) {
+      const e = new Error("Empty audio stream");
+      e.name = "NoAudioReceived";
+      throw e;
+    }
+    return { parts, total, durationMs, words };
+  })();
+  // On timeout close the socket so the isolate does not keep a dead connection.
+  return withTimeout(run, timeoutMs, "Synthesis attempt timed out", () => communicate.abort());
 }
 
+/**
+ * Synthesise `params.text`: split into ~4 KB pieces, run them in parallel
+ * (each piece retried independently) and concatenate the MP3 frames in order.
+ * The audio is CBR 48 kbit/s so the exact duration is derived from the size.
+ */
 async function synthesize(params, cfg, collectWords = false) {
-  let lastErr = null;
   const deadline = Date.now() + (cfg.synthTimeout - 2) * 1000;
-  for (let attempt = 1; attempt <= cfg.retries; attempt++) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 1000) break;
-    runner.active += 1;
-    let pause = 0;
-    try {
-      const wait = runner.cooldownUntil - Date.now();
-      if (wait > 0) await sleep(Math.min(wait, remaining / 2));
-      const result = await withTimeout(
-        synthesizeOnce(params, collectWords),
-        Math.max(5000, Math.min(cfg.attemptTimeout * 1000, deadline - Date.now())),
-        "Synthesis attempt timed out",
-      );
-      runner.noteSuccess();
-      return result;
-    } catch (err) {
-      lastErr = err;
-      pause = looksThrottled(err) ? runner.noteThrottle() : 0;
-      console.warn(`Synthesis attempt ${attempt}/${cfg.retries} failed (${err?.name}): ${err?.message}`);
-    } finally {
-      runner.active -= 1;
+  const pieces = splitPieces(params.text);
+  const pieceParallelism = collectWords ? 1 : PIECE_PARALLELISM; // word offsets must stay sequential
+
+  const onePiece = async (text) => {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= cfg.retries; attempt++) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 1000) break;
+      runner.active += 1;
+      try {
+        const res = await streamPiece(text, params, collectWords, Math.max(5000, Math.min(cfg.attemptTimeout * 1000, remaining)));
+        runner.noteSuccess();
+        return res;
+      } catch (err) {
+        lastErr = err;
+        if (looksThrottled(err)) runner.noteThrottle();
+        console.warn(`Synthesis attempt ${attempt}/${cfg.retries} failed (${err?.name}): ${err?.message}`);
+      } finally {
+        runner.active -= 1;
+      }
+      if (attempt < cfg.retries) {
+        const backoff = Math.min(8, 1.5 ** attempt + Math.random() * 0.8);
+        await sleep(Math.min(backoff * 1000, Math.max(0, deadline - Date.now())));
+      }
     }
-    if (attempt < cfg.retries) {
-      const backoff = Math.min(30, 1.5 ** attempt + pause + 0.1 + Math.random() * 0.7);
-      await sleep(Math.min(backoff * 1000, Math.max(0, deadline - Date.now())));
+    throw lastErr || new Error("Synthesis failed");
+  };
+
+  let lastErr = null;
+  try {
+    const results = await mapLimit(pieces, pieceParallelism, onePiece);
+    let total = 0;
+    for (const r of results) total += r.total;
+    const audio = new Uint8Array(total);
+    let off = 0;
+    const words = [];
+    let wordOffset = 0;
+    for (const r of results) {
+      for (const p of r.parts) {
+        audio.set(p, off);
+        off += p.length;
+      }
+      if (collectWords) {
+        for (const w of r.words) words.push({ text: w.text, start_ms: w.start_ms + wordOffset, end_ms: w.end_ms + wordOffset });
+        wordOffset += Math.round((r.total * 8) / 48);
+      }
     }
+    // 48 kbit/s CBR: 6 bytes per millisecond.
+    const durationMs = Math.max(1, Math.round((total * 8) / 48));
+    return { audio, durationMs, words };
+  } catch (err) {
+    lastErr = err;
   }
   const detail = `TTS failed after ${cfg.retries} attempts: ${lastErr?.name || "Error"}: ${lastErr?.message || lastErr}`;
   if (lastErr && looksThrottled(lastErr)) {
@@ -418,6 +486,8 @@ function health(cfg) {
     free_slots: Math.max(0, cfg.maxConcurrency - runner.active),
     queued: 0,
     min_start_gap_ms: 0,
+    piece_bytes: PIECE_BYTES,
+    piece_parallelism: PIECE_PARALLELISM,
     throttled: runner.throttled,
     throttle_events: runner.throttleEvents,
     auth_required: Boolean(cfg.apiKey),
