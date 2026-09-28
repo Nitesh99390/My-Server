@@ -47,6 +47,22 @@ never sent twice.  A Worker that Microsoft throttles is benched alone
 (1 -> 2 -> 5 -> 10 min) while the job continues on the others; the job only
 pauses (never dies) when every Worker is out.
 
+### Adding a Worker from Telegram
+
+1. `/admin` -> **➕ Add Server** -> paste the Worker URL
+   (`https://<name>.<account>.workers.dev`, several per message allowed), or
+2. `/addserver https://<name>.<account>.workers.dev` from anywhere.
+
+The bot calls `/health` and does a real `/tts` synthesis before registering.
+If the test fails you get the reason (wrong URL, API key missing, throttled...)
+and an **➕ Add anyway** button; the health loop re-tests it every few minutes.
+**🖥 Server Status** / `/servers` re-probes all registered Workers.
+
+Troubleshooting: if the bot logs `logged in as @...` but never answers any
+button or command, you are running an old `bot.py` that started Pyrogram on a
+different event loop than the one its handlers were bound to (fixed in 5.0.1 -
+`git pull` and restart the service).
+
 ## 2. TTS Worker on Cloudflare (`worker/`)
 
 ## Quick start
