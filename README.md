@@ -38,30 +38,76 @@ journalctl -u audiobook-bot -f
 
 `deploy/install-oracle.sh` does the apt/venv/pip steps for you.
 
-Bot features: approval-based users, `/settings` (voice, rate, pitch, volume, hours
-per part, chapter split), `/preview`, `/cancel`, `/queue`, `/resume`, `/history`,
-admin panel (`/admin`: add/remove Workers with a live synthesis test, `/servers`,
-approve/revoke/ban, `/users`, broadcast, `/stats`, `/jobs`).  Every chunk is
-checkpointed under `JOBS_DIR`, so a restart resumes the job; delivered parts are
-never sent twice.  A Worker that Microsoft throttles is benched alone
-(1 -> 2 -> 5 -> 10 min) while the job continues on the others; the job only
-pauses (never dies) when every Worker is out.
+### What the user sees
+
+The reply keyboard is just two rows (`🎧 Create Audio` `⚙️ Settings` /
+`📊 My Status` `🛠 Admin` `❓ Help`); everything else is an inline menu that
+edits itself in place, and the `/` command menu is registered with Telegram.
+
+Every job is **one status card** that is edited live through all stages:
+
+```
+🎧 My Novel
+🗣 Madhur (Male) [Hindi]
+✅ Queue › ✅ Prepare › 🔵 Voice › ⚪ Send › ⚪ Done
+
+██████░░░░░░ 52%
+📝 312,400 / 600,000 chars · chunk 105/201
+🎵 5h 46m of audio ready
+⚡ 1,380 chars/s (~92× realtime) · 4/4 requests in flight
+⏱ 3m 46s elapsed · ETA 3m 28s
+
+📤 Sending part 1 · 63%
+🖥 ✅ edge-tts-worker 4/4
+```
+
+Before that the same card shows *Downloading 37%* -> *Extracting text* ->
+*Splitting into chunks* -> *Checking Workers*; at the end a summary with
+duration, parts, speed and a **New audiobook** button.  A paused job (every
+Worker throttled) shows why, the last error and the retry countdown.
+
+`📊 My Status` = account, current job (with Cancel), queue, history, resume.
+`🛠 Admin` = Workers (add / test all / remove), Users (list, requests with
+one-tap approve, approve/revoke by id), Jobs (with kill buttons), Stats,
+Broadcast (with progress).
+
+Every chunk is checkpointed under `JOBS_DIR`, so a restart resumes the job;
+delivered parts are never sent twice.  A Worker that Microsoft throttles is
+benched alone (1 -> 2 -> 5 -> 10 min) while the job continues on the others;
+the job only pauses (never dies) when every Worker is out.
 
 ### Adding a Worker from Telegram
 
-1. `/admin` -> **➕ Add Server** -> paste the Worker URL
+1. `🛠 Admin` -> **🖥 Workers** -> **➕ Add** -> paste the Worker URL
    (`https://<name>.<account>.workers.dev`, several per message allowed), or
 2. `/addserver https://<name>.<account>.workers.dev` from anywhere.
 
 The bot calls `/health` and does a real `/tts` synthesis before registering.
 If the test fails you get the reason (wrong URL, API key missing, throttled...)
 and an **➕ Add anyway** button; the health loop re-tests it every few minutes.
-**🖥 Server Status** / `/servers` re-probes all registered Workers.
+**🔄 Test all** / `/servers` re-probes all registered Workers.
+
+### API key is optional
+
+`TTS_API_KEY` may stay empty.  Only if you ran `wrangler secret put API_KEY` on
+the Worker do you need the same value on the bot; the Worker test tells you
+exactly that if they do not match.  You can add it to `.env` later and restart.
+
+### Upgrading from bot.py 4.x
+
+Just replace `bot.py` and restart.  On first start the old database
+(`users.expiry_date`, `render_servers`, `user_settings`) is upgraded in place:
+approved users, bans, per-user voice settings and Worker URLs are kept.
+(Running a 5.0.x bot on a 4.x database crashed every handler with
+`IndexError: No item with that key` - fixed in 5.1.0.)
 
 Troubleshooting: if the bot logs `logged in as @...` but never answers any
 button or command, you are running an old `bot.py` that started Pyrogram on a
 different event loop than the one its handlers were bound to (fixed in 5.0.1 -
 `git pull` and restart the service).
+
+Offline self-test (no credentials needed): `python tests_bot/test_offline.py`
+and `python tests_bot/test_routing.py`.
 
 ## 2. TTS Worker on Cloudflare (`worker/`)
 

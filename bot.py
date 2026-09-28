@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 =============================================================================
- AudioBook Pro - Telegram TTS master bot  (bot.py)  -  v5.0.0
+ AudioBook Pro - Telegram TTS master bot  (bot.py)  -  v5.1.0
 =============================================================================
  The *master* side of the system.  It runs on your own VPS (Oracle Cloud
  free tier is plenty) and turns text / documents sent on Telegram into MP3
@@ -26,8 +26,14 @@
    * Script detection -> an English voice is switched to a Hindi/Bengali/...
      voice automatically when the text needs it.
    * Every chunk is checkpointed to disk; jobs resume after a restart.
-   * Visible job queue, live progress bar with ETA, /cancel, voice preview,
-     20+ voices, user approval system, admin panel, rotating logs.
+   * One live status card per job through every stage
+     (Queue > Prepare > Voice > Send > Done) with download %, extraction,
+     chunking, synthesis %, speed, ETA, audio-ready time and upload % per part.
+   * Tiny two-row reply keyboard; everything else is an inline menu
+     (My Status, Settings, Admin panel) that edits itself in place.
+   * Visible job queue, /cancel, voice preview, 20+ voices, user approval
+     system, rotating logs.  TTS_API_KEY is optional.
+   * Databases from bot.py 4.x are upgraded in place on first start.
    * Optional ffmpeg re-mux for perfect MP3 headers (auto-detected).
 
  Quick start on Oracle VPS (Ubuntu)
@@ -108,7 +114,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
-VERSION = "5.0.1"
+VERSION = "5.1.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -465,14 +471,108 @@ class Database:
             )
             self._migrate()
 
+    # Every column the v5 code reads.  ``CREATE TABLE IF NOT EXISTS`` does nothing
+    # for a database created by an older bot, so each column is checked one by
+    # one (a missing column makes ``row["voice"]`` raise IndexError and kills
+    # every handler).
+    _SCHEMA: Dict[str, List[Tuple[str, str]]] = {
+        "users": [("username", "TEXT"), ("first_name", "TEXT"), ("approved", "INTEGER DEFAULT 0"),
+                  ("banned", "INTEGER DEFAULT 0"), ("expiry", "TEXT"), ("joined", "TEXT"), ("voice", "TEXT"),
+                  ("rate", "TEXT"), ("pitch", "TEXT"), ("volume", "TEXT"), ("hours", "INTEGER"),
+                  ("split_mode", "TEXT"), ("total_jobs", "INTEGER DEFAULT 0"), ("total_chars", "INTEGER DEFAULT 0"),
+                  ("total_seconds", "REAL DEFAULT 0")],
+        "servers": [("added", "TEXT"), ("enabled", "INTEGER DEFAULT 1"), ("note", "TEXT")],
+        "jobs": [("user_id", "INTEGER"), ("title", "TEXT"), ("chars", "INTEGER"), ("chunks", "INTEGER"),
+                 ("voice", "TEXT"), ("status", "TEXT"), ("created", "TEXT"), ("finished", "TEXT"),
+                 ("duration", "REAL DEFAULT 0"), ("parts", "INTEGER DEFAULT 0"), ("error", "TEXT"),
+                 ("chat_id", "INTEGER"), ("settings", "TEXT"), ("text_path", "TEXT"),
+                 ("cursor", "INTEGER DEFAULT 0"), ("delivered_parts", "INTEGER DEFAULT 0"),
+                 ("delivered_cursor", "INTEGER DEFAULT 0"), ("last_error", "TEXT"), ("stall_since", "TEXT"),
+                 ("updated", "TEXT")],
+        "requests": [("requested", "TEXT"), ("note", "TEXT")],
+    }
+
+    def _cols(self, table: str) -> set:
+        return {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+
+    def _has_table(self, table: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+
     def _migrate(self) -> None:
-        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(jobs)")}
-        for col, typ in (("chat_id", "INTEGER"), ("settings", "TEXT"), ("text_path", "TEXT"),
-                         ("cursor", "INTEGER DEFAULT 0"), ("delivered_parts", "INTEGER DEFAULT 0"),
-                         ("delivered_cursor", "INTEGER DEFAULT 0"),
-                         ("last_error", "TEXT"), ("stall_since", "TEXT"), ("updated", "TEXT")):
-            if col not in cols:
-                self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
+        added: List[str] = []
+        for table, columns in self._SCHEMA.items():
+            have = self._cols(table)
+            for col, typ in columns:
+                if col not in have:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+                    added.append(f"{table}.{col}")
+        if added:
+            logging.getLogger("audiobook").info("database upgraded: added %s", ", ".join(added))
+        self._import_legacy()
+
+    def _import_legacy(self) -> None:
+        """One-time import of data written by bot.py <= 4.3 (different table layout)."""
+        if self.conn.execute("SELECT value FROM kv WHERE key='legacy_import_v5'").fetchone():
+            return
+        log_ = logging.getLogger("audiobook")
+        now = now_str()
+        ucols = self._cols("users")
+        try:
+            if "expiry_date" in ucols:
+                # v4: approved == expiry_date in the future, is_admin == lifetime
+                self.conn.execute(
+                    "UPDATE users SET "
+                    "  expiry = CASE WHEN expiry IS NULL AND COALESCE(is_admin,0)=0 THEN expiry_date ELSE expiry END,"
+                    "  approved = CASE WHEN approved=1 OR COALESCE(is_admin,0)=1 "
+                    "                   OR (expiry_date IS NOT NULL AND expiry_date > ?) THEN 1 ELSE 0 END",
+                    (now,))
+            if "is_banned" in ucols:
+                self.conn.execute("UPDATE users SET banned = COALESCE(banned, 0) | COALESCE(is_banned, 0)")
+            if "joined_at" in ucols:
+                self.conn.execute("UPDATE users SET joined = COALESCE(joined, joined_at)")
+            if "usage_count" in ucols:
+                self.conn.execute("UPDATE users SET total_jobs = COALESCE(NULLIF(total_jobs,0), usage_count, 0)")
+            if "chars_total" in ucols:
+                self.conn.execute("UPDATE users SET total_chars = COALESCE(NULLIF(total_chars,0), chars_total, 0)")
+            if "audio_seconds" in ucols:
+                self.conn.execute("UPDATE users SET total_seconds = COALESCE(NULLIF(total_seconds,0), audio_seconds, 0)")
+            if self._has_table("user_settings"):
+                scols = self._cols("user_settings")
+                for r in self.conn.execute("SELECT * FROM user_settings").fetchall():
+                    self.conn.execute("INSERT OR IGNORE INTO users(user_id, joined) VALUES (?, ?)", (r["user_id"], now))
+                    self.conn.execute(
+                        "UPDATE users SET voice=COALESCE(voice,?), rate=COALESCE(rate,?), pitch=COALESCE(pitch,?),"
+                        " volume=COALESCE(volume,?), hours=COALESCE(hours,?), split_mode=COALESCE(split_mode,?)"
+                        " WHERE user_id=?",
+                        (r["voice"] if "voice" in scols else None, r["rate"] if "rate" in scols else None,
+                         r["pitch"] if "pitch" in scols else None, r["volume"] if "volume" in scols else None,
+                         r["max_hours"] if "max_hours" in scols else None,
+                         r["split_mode"] if "split_mode" in scols else None, r["user_id"]))
+            if self._has_table("render_servers"):
+                n = 0
+                for r in self.conn.execute("SELECT url FROM render_servers").fetchall():
+                    nu = normalize_server_url(r["url"] or "")
+                    if nu:
+                        cur = self.conn.execute("INSERT OR IGNORE INTO servers(url, added, enabled, note) VALUES (?,?,1,?)",
+                                                (nu, now, "imported from v4 database"))
+                        n += cur.rowcount
+                if n:
+                    log_.info("imported %d Worker URL(s) from the v4 database", n)
+            jcols = self._cols("jobs")
+            if "created_at" in jcols:
+                self.conn.execute("UPDATE jobs SET created = COALESCE(created, created_at)")
+            if "finished_at" in jcols:
+                self.conn.execute("UPDATE jobs SET finished = COALESCE(finished, finished_at)")
+            if "audio_seconds" in jcols:
+                self.conn.execute("UPDATE jobs SET duration = COALESCE(NULLIF(duration,0), audio_seconds, 0)")
+            if "source" in jcols:
+                self.conn.execute("UPDATE jobs SET title = COALESCE(title, source)")
+            # v4 jobs cannot be resumed by v5 (different checkpoint layout) - close them
+            self.conn.execute("UPDATE jobs SET status='failed', error='not resumable after upgrade', finished=? "
+                              "WHERE status IN ('queued','running','paused','interrupted') AND text_path IS NULL", (now,))
+        except sqlite3.Error as e:
+            log_.warning("legacy import skipped: %s", e)
+        self.conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES ('legacy_import_v5', ?)", (now,))
 
     # --- generic -----------------------------------------------------------
     def q(self, sql: str, params: Tuple = ()) -> List[sqlite3.Row]:
@@ -532,10 +632,15 @@ class Database:
         if not row:
             return {"voice": DEFAULT_VOICE, "rate": DEFAULT_RATE, "pitch": DEFAULT_PITCH, "volume": DEFAULT_VOLUME,
                     "hours": DEFAULT_HOURS, "split_mode": DEFAULT_SPLIT}
+        keys = row.keys()
+
+        def g(k: str, default: Any) -> Any:
+            return (row[k] if k in keys else None) or default
+
         return {
-            "voice": row["voice"] or DEFAULT_VOICE, "rate": row["rate"] or DEFAULT_RATE,
-            "pitch": row["pitch"] or DEFAULT_PITCH, "volume": row["volume"] or DEFAULT_VOLUME,
-            "hours": row["hours"] or DEFAULT_HOURS, "split_mode": row["split_mode"] or DEFAULT_SPLIT,
+            "voice": g("voice", DEFAULT_VOICE), "rate": g("rate", DEFAULT_RATE),
+            "pitch": g("pitch", DEFAULT_PITCH), "volume": g("volume", DEFAULT_VOLUME),
+            "hours": g("hours", DEFAULT_HOURS), "split_mode": g("split_mode", DEFAULT_SPLIT),
         }
 
     def set_setting(self, uid: int, key: str, value: Any) -> None:
@@ -585,6 +690,11 @@ class Database:
 
     def user_history(self, uid: int, limit: int = 10) -> List[sqlite3.Row]:
         return self.q("SELECT * FROM jobs WHERE user_id=? ORDER BY id DESC LIMIT ?", (uid, limit))
+
+    def counts(self) -> Dict[str, int]:
+        u = self.one("SELECT COUNT(*) AS n, COALESCE(SUM(approved),0) AS a, COALESCE(SUM(banned),0) AS b FROM users")
+        p = self.one("SELECT COUNT(*) AS n FROM requests")
+        return {"users": int(u["n"]), "approved": int(u["a"]), "banned": int(u["b"]), "pending": int(p["n"])}
 
 
 # =============================================================================
@@ -1091,8 +1201,10 @@ async def check_server(session: aiohttp.ClientSession, url: str, deep: bool = Fa
     except Exception as exc:  # noqa: BLE001
         info["error"] = f"unreachable ({type(exc).__name__})"
     if info["ok"] and info.get("auth_required") and not TTS_API_KEY:
+        # The Worker has an API_KEY secret but the bot has none - every /tts would be 401.
         info["ok"] = False
-        info["error"] = "Worker requires an API key but TTS_API_KEY is not set on the bot"
+        info["error"] = ("Worker has an API_KEY secret - put the same value in TTS_API_KEY on the bot "
+                         "(or remove the secret from the Worker)")
         return info
     if info["ok"] and deep:
         ok, reason = await probe_tts(session, url)
@@ -1470,6 +1582,16 @@ class Job:
     done_chars: int = 0
     running: bool = False
     status_line: str = ""
+    stage: str = "starting"      # starting / queued / preparing / synth / uploading / paused / done
+    upload_note: str = ""        # "part 2 · 45%" while an MP3 is being sent
+    parts_sent: int = 0
+
+    @property
+    def stale(self) -> bool:
+        """True when the job can no longer make progress (task finished/crashed or never started)."""
+        if self.task is not None:
+            return self.task.done()
+        return time.time() - self.queued_at > 180
 
 
 class JobQueue:
@@ -1541,12 +1663,27 @@ active_jobs: Dict[int, Job] = {}  # user_id -> Job
 
 
 def reserve_job(uid: int, title: str = "", chars: int = 0) -> Optional[Job]:
-    if uid in active_jobs:
+    old = active_jobs.get(uid)
+    if old is not None and old.stale:
+        # a crashed / never-started job must not block the user forever
+        log.warning("dropping stale job of user %s (%s)", uid, old.title[:30])
+        release_job(old)
+        old = None
+    if old is not None:
         return None
     if len(job_queue.waiting) >= MAX_QUEUED_JOBS:
         return None
     job = Job(user_id=uid, title=title, chars=chars)
     active_jobs[uid] = job
+    return job
+
+
+def current_job(uid: int) -> Optional[Job]:
+    """The user's live job, dropping a stale one on the way."""
+    job = active_jobs.get(uid)
+    if job is not None and job.stale:
+        release_job(job)
+        return None
     return job
 
 
@@ -1600,6 +1737,34 @@ def cancel_markup(job_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Cancel", callback_data=f"canceljob:{job_id}")]])
 
 
+# The five stages every job walks through, shown as a compact step line so the
+# user always knows *where* the job is, not only what percentage it has reached.
+JOB_STAGES = [("queued", "Queue"), ("preparing", "Prepare"), ("synth", "Voice"), ("uploading", "Send"),
+              ("done", "Done")]
+
+
+def stage_line(current: str) -> str:
+    order = [k for k, _ in JOB_STAGES]
+    cur = current if current in order else ("synth" if current == "paused" else "queued")
+    idx = order.index(cur)
+    parts = []
+    for i, (key, label) in enumerate(JOB_STAGES):
+        if i < idx:
+            parts.append(f"✅ {label}")
+        elif i == idx:
+            parts.append(f"{'⏸' if current == 'paused' else '🔵'} <b>{label}</b>")
+        else:
+            parts.append(f"⚪ {label}")
+    return " › ".join(parts)
+
+
+def job_card(header: str, job: Job, body: str, footer: str = "") -> str:
+    txt = f"{header}\n{stage_line(job.stage)}\n\n{body}"
+    if footer:
+        txt += f"\n\n{footer}"
+    return txt
+
+
 async def wait_for_engines(session: aiohttp.ClientSession, cancel: asyncio.Event, status: Optional[Message],
                            job_id: int, header: str, stall_round: int, reason: str) -> None:
     """Every engine failed: pause with escalating back-off, re-probe, continue."""
@@ -1611,9 +1776,10 @@ async def wait_for_engines(session: aiohttp.ClientSession, cancel: asyncio.Event
     why = ("Microsoft is throttling every TTS Worker" if all_benched and any(s.benched for s in pool.states())
            else "All TTS Workers are failing")
     await safe_edit(status,
-                    f"{header}\n\n⏸ <b>Paused</b> - {why}.\n"
+                    f"{header}\n{stage_line('paused')}\n\n"
+                    f"⏸ <b>Paused</b> - {why}.\n"
                     f"Last error: <code>{html.escape(reason[:160])}</code>\n"
-                    f"Engines: {html.escape(pool.summary())}\n"
+                    f"Workers: {html.escape(pool.summary())}\n"
                     f"Retrying in {delay}s (round {stall_round + 1}). The job does not give up - /cancel to stop.",
                     cancel_markup(job_id))
     await cancellable_sleep(delay, cancel)
@@ -1638,13 +1804,15 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
     uploader_task: Optional[asyncio.Task] = None
     in_flight: Dict[int, asyncio.Task] = {}
 
+    base_header = f"🎧 <b>{html.escape(title[:60])}</b>"
     try:
         # ---------------- queue -------------------------------------------
-        pos = job_queue.position(job)
+        job.stage = "queued"
         if job_queue.running and len(job_queue.running) >= job_queue.parallel:
             await safe_edit(status,
-                            f"🕒 <b>Queued</b> - position #{len(job_queue.waiting) + 1}\n"
-                            f"Running {len(job_queue.running)}/{job_queue.parallel}. /queue for details.",
+                            job_card(base_header, job,
+                                     f"🕒 <b>Waiting in queue</b> - position #{len(job_queue.waiting) + 1}\n"
+                                     f"Running {len(job_queue.running)}/{job_queue.parallel} · /queue for details"),
                             cancel_markup(job_id or 0))
         enter = asyncio.ensure_future(job_queue.enter(job))
         while not enter.done():
@@ -1653,19 +1821,30 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
                 pos = job_queue.position(job)
                 eta = job_queue.eta_seconds(job)
                 await safe_edit(status,
-                                f"🕒 <b>Queued</b> - position #{pos} of {len(job_queue.waiting)}\n"
-                                f"Running {len(job_queue.running)}/{job_queue.parallel} · estimated start ~{fmt_duration(eta)}",
+                                job_card(base_header, job,
+                                         f"🕒 <b>Waiting in queue</b> - position #{pos} of {len(job_queue.waiting)}\n"
+                                         f"Running {len(job_queue.running)}/{job_queue.parallel} · "
+                                         f"estimated start ~{fmt_duration(eta)}"),
                                 cancel_markup(job_id or 0))
         enter.result()  # raises JobCancelled
 
         # ---------------- prepare -----------------------------------------
+        job.stage = "preparing"
         if MIN_FREE_DISK_MB and free_disk_mb(JOBS_DIR if os.path.isdir(JOBS_DIR) else BASE_DIR) < MIN_FREE_DISK_MB:
             raise RuntimeError(f"Not enough free disk space on the bot server (< {MIN_FREE_DISK_MB} MB)")
-        await safe_edit(status, "🔍 Checking TTS Workers...", cancel_markup(job_id or 0))
+        await safe_edit(status, job_card(base_header, job, "🔍 Checking TTS Workers…"), cancel_markup(job_id or 0))
         await pool.refresh(session)
         if not pool.states():
-            raise RuntimeError("No TTS Worker registered. Admin: /admin -> ➕ Add Server (or set TTS_SERVERS).")
+            raise RuntimeError("No TTS Worker registered yet. Admin: 🛠 Admin → Workers → ➕ Add "
+                               "(or put the URL in TTS_SERVERS).")
+        if not pool.usable():
+            await safe_edit(status,
+                            job_card(base_header, job,
+                                     "⚠️ No Worker is answering right now - I will keep retrying.\n"
+                                     f"Workers: {html.escape(pool.summary())}"),
+                            cancel_markup(job_id or 0))
 
+        await safe_edit(status, job_card(base_header, job, "📖 Reading the text…"), cancel_markup(job_id or 0))
         with open(text_path, "r", encoding="utf-8") as fh:
             text = fh.read()
         orig_voice = settings.get("voice_requested") or settings.get("voice", DEFAULT_VOICE)
@@ -1684,6 +1863,10 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
             plan = read_plan(plan_path)
         else:
             chunk_limit = pool.chunk_limit()
+            await safe_edit(status,
+                            job_card(base_header, job,
+                                     f"✂️ Splitting {len(text):,} characters into chunks of ~{chunk_limit:,}…"),
+                            cancel_markup(job_id))
             plan = await asyncio.to_thread(build_plan, text, chunk_limit, settings.get("split_mode") == "chapter")
             if not plan:
                 raise RuntimeError("Nothing to read - the document has no pronounceable text.")
@@ -1697,9 +1880,10 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
                       settings=json.dumps(settings), stall_since=None)
 
         # ---------------- synthesis pipeline ------------------------------
-        header = f"🎧 <b>{html.escape(title[:60])}</b>\n🗣 {html.escape(voice_label(settings['voice']))}"
+        header = f"{base_header}\n🗣 {html.escape(voice_label(settings['voice']))}"
         if voice_note:
             header += f"\n{voice_note}"
+        job.stage = "synth"
         row = db.job(job_id)
         delivered_parts = int(row["delivered_parts"] or 0) if row else 0
         delivered_cursor = int(row["delivered_cursor"] or 0) if row else 0
@@ -1753,8 +1937,16 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
                     return
                 p_path, p_no, p_dur, p_title, p_start, p_end = item
                 try:
-                    await deliver_part(client, chat_id, p_path, p_no, p_dur, title, p_title, settings, cancel)
+                    def on_upload(sent: int, total_b: int, _no: int = p_no) -> None:
+                        pct_u = int(100 * sent / max(1, total_b))
+                        job.upload_note = f"part {_no} · {pct_u}%"
+
+                    job.upload_note = f"part {p_no} · preparing"
+                    await deliver_part(client, chat_id, p_path, p_no, p_dur, title, p_title, settings, cancel,
+                                       progress=on_upload)
                     parts_sent = max(parts_sent, p_no)
+                    job.parts_sent = parts_sent
+                    job.upload_note = ""
                     db.update_job(job_id, delivered_parts=parts_sent, delivered_cursor=p_end)
                     # chunk files are only removed once their part is safely delivered
                     for k in range(p_start, p_end):
@@ -1766,6 +1958,7 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
                 except Exception as e:  # noqa: BLE001
                     log.exception("upload of part %d failed", p_no)
                     upload_errors.append(f"part {p_no}: {type(e).__name__}: {str(e)[:80]}")
+                    job.upload_note = ""
                 finally:
                     with contextlib.suppress(OSError):
                         if os.path.exists(p_path):
@@ -1788,13 +1981,17 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
 
         uploader_task = asyncio.create_task(uploader())
 
+        def audio_so_far() -> float:
+            # seconds of audio already synthesised (chunk metas of finished chunks + open part)
+            return (total_duration_ms + part_dur) / 1000.0
+
         async def progress(force: bool = False) -> None:
             nonlocal last_edit
             now = time.time()
             if not force and now - last_edit < PROGRESS_EDIT_INTERVAL:
                 return
             last_edit = now
-            pct = int(100 * job.done_chunks / max(1, total))
+            pct = int(100 * job.done_chars / max(1, total_chars))
             elapsed = max(1e-6, now - t_start)
             cps = (job.done_chars - chars_at_start) / elapsed
             remaining = max(0, total_chars - job.done_chars)
@@ -1803,17 +2000,20 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
             rt = spoken / elapsed if elapsed > 0 else 0
             inflight = sum(s.limiter.active for s in pool.states())
             limit = sum(s.limiter.limit for s in pool.usable())
+            body = (f"{progress_bar(pct)} <b>{pct}%</b>\n"
+                    f"📝 {job.done_chars:,} / {total_chars:,} chars · chunk {job.done_chunks}/{total}\n"
+                    f"🎵 {fmt_duration(audio_so_far())} of audio ready\n"
+                    f"⚡ {cps:,.0f} chars/s (~{rt:.0f}× realtime) · {inflight}/{limit} requests in flight\n"
+                    f"⏱ {fmt_duration(elapsed)} elapsed · ETA {fmt_duration(eta) if cps > 0 else '…'}")
+            up = f"📤 Sending {job.upload_note}" if job.upload_note else f"📤 Parts sent: {parts_sent}"
+            if upload_queue.qsize() > 0 and not job.upload_note:
+                up += f" · {upload_queue.qsize()} waiting"
+            footer = f"{up}\n🖥 {html.escape(pool.summary())}"
             r_cnt, w_cnt = job_queue.counts()
-            txt = (f"{header}\n\n"
-                   f"{progress_bar(pct)} <b>{pct}%</b>\n"
-                   f"Chunks {job.done_chunks}/{total} · {job.done_chars:,}/{total_chars:,} chars\n"
-                   f"Speed {cps:,.0f} chars/s (~{rt:.0f}× realtime) · in flight {inflight}/{limit}\n"
-                   f"Elapsed {fmt_duration(elapsed)} · ETA {fmt_duration(eta) if cps > 0 else '…'}\n"
-                   f"Parts sent {parts_sent}\n"
-                   f"Engines: {html.escape(pool.summary())}\n"
-                   f"Queue: running {r_cnt} · waiting {w_cnt}")
+            if w_cnt:
+                footer += f"\n🧾 Queue: {r_cnt} running · {w_cnt} waiting"
             job.status_line = f"{pct}% · {job.done_chunks}/{total}"
-            await safe_edit(status, txt, cancel_markup(job_id))
+            await safe_edit(status, job_card(header, job, body, footer), cancel_markup(job_id))
 
         # Resume: chunks of delivered parts are gone for good, the writer restarts
         # at the first chunk of the first undelivered part (its chunk files are
@@ -1947,9 +2147,27 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
             await progress()
 
         await close_part(final=True)
-        await progress(force=True)
-        await safe_edit(status, f"{header}\n\n📤 Uploading remaining part(s)...", cancel_markup(job_id))
+        job.stage = "uploading"
         await upload_queue.put(None)
+        total_parts = part_no - 1
+        # live upload progress while the last part(s) are being sent
+        first = True
+        while not uploader_task.done():
+            if not first:
+                await asyncio.wait({uploader_task}, timeout=PROGRESS_EDIT_INTERVAL)
+            first = False
+            if uploader_task.done():
+                break
+            note = job.upload_note or (f"part {parts_sent + 1} · preparing" if parts_sent < total_parts else "finishing…")
+            waiting = max(0, total_parts - parts_sent - 1)
+            if waiting:
+                note += f" · {waiting} more waiting"
+            await safe_edit(status,
+                            job_card(header, job,
+                                     f"{progress_bar(100)} <b>100%</b>\n"
+                                     f"🎵 {fmt_duration(total_duration_ms / 1000)} of audio · {total_parts} part(s)\n"
+                                     f"📤 Sending {html.escape(note)} · {parts_sent}/{total_parts} delivered"),
+                            cancel_markup(job_id))
         await uploader_task
         uploader_task = None
 
@@ -1957,22 +2175,27 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
             raise RuntimeError("Upload failed: " + "; ".join(upload_errors[:3]))
         elapsed = time.time() - t_start
         dur_s = total_duration_ms / 1000.0
+        job.stage = "done"
         db.update_job(job_id, status="done", finished=now_str(), duration=dur_s, parts=parts_sent)
         db.add_usage(uid, total_chars, dur_s)
         cleanup_job_dir(job_id)
         with contextlib.suppress(OSError):
             os.remove(text_path)
+        speed = (dur_s / elapsed) if elapsed > 0 else 0
         await safe_edit(status,
-                        f"✅ <b>Done</b> - {html.escape(title[:60])}\n"
-                        f"{parts_sent} part(s) · {fmt_duration(dur_s)} of audio · {total_chars:,} chars\n"
-                        f"Generated in {fmt_duration(elapsed)} · voice {html.escape(voice_label(settings['voice']))}")
+                        f"✅ <b>Done</b> - {html.escape(title[:60])}\n{stage_line('done')}\n\n"
+                        f"🎵 {fmt_duration(dur_s)} of audio in {parts_sent} part(s)\n"
+                        f"📝 {total_chars:,} characters · 🗣 {html.escape(voice_label(settings['voice']))}\n"
+                        f"⏱ Generated in {fmt_duration(elapsed)} (~{speed:.0f}× realtime)",
+                        InlineKeyboardMarkup([[InlineKeyboardButton("🎧 New audiobook", callback_data="new"),
+                                               InlineKeyboardButton("⚙️ Settings", callback_data="back_settings")]]))
     except JobCancelled:
         if job_id:
             db.update_job(job_id, status="cancelled", finished=now_str())
             cleanup_job_dir(job_id)
         with contextlib.suppress(OSError):
             os.remove(text_path)
-        await safe_edit(status, "⛔ Job cancelled.")
+        await safe_edit(status, f"⛔ <b>Cancelled</b> - {html.escape(title[:60])}")
     except asyncio.CancelledError:
         if job_id:
             db.update_job(job_id, status="interrupted", last_error="bot shut down")
@@ -1984,7 +2207,8 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
             cleanup_job_dir(job_id)
         with contextlib.suppress(OSError):
             os.remove(text_path)
-        await safe_edit(status, f"❌ <b>Failed</b>: {html.escape(str(e)[:400])}")
+        await safe_edit(status, f"❌ <b>Failed</b> - {html.escape(title[:60])}\n\n{html.escape(str(e)[:400])}",
+                        InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Try again", callback_data="new")]]))
     finally:
         for t in in_flight.values():
             if not t.done():
@@ -2004,7 +2228,8 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
 
 
 async def deliver_part(client: Client, chat_id: int, path: str, part_no: int, dur_ms: int, title: str,
-                       chapter: str, settings: Dict[str, Any], cancel: asyncio.Event) -> None:
+                       chapter: str, settings: Dict[str, Any], cancel: asyncio.Event,
+                       progress: Optional[Any] = None) -> None:
     if cancel.is_set():
         raise JobCancelled()
     path = await remux_mp3(path)
@@ -2021,7 +2246,8 @@ async def deliver_part(client: Client, chat_id: int, path: str, part_no: int, du
     for attempt in range(4):
         try:
             await client.send_audio(chat_id, path, caption=caption, title=f"{title[:60]} - Part {part_no}",
-                                    performer="AudioBook Pro", duration=int(dur_ms / 1000), file_name=fname)
+                                    performer="AudioBook Pro", duration=int(dur_ms / 1000), file_name=fname,
+                                    progress=progress)
             return
         except FloodWait as e:
             await asyncio.sleep(min(120, int(getattr(e, "value", 10)) + 1))
@@ -2033,131 +2259,133 @@ async def deliver_part(client: Client, chat_id: int, path: str, part_no: int, du
 
 
 # =============================================================================
-# Keyboards
+# Keyboards & UI helpers
 # =============================================================================
+# The reply keyboard is deliberately tiny (two rows) so it never covers the
+# chat; everything else lives in inline menus that edit themselves in place.
 BTN_CREATE = "🎧 Create Audio"
 BTN_SETTINGS = "⚙️ Settings"
-BTN_PREVIEW = "🔊 Voice Preview"
-BTN_HISTORY = "📜 History"
-BTN_ACCOUNT = "👤 My Account"
-BTN_STATUS = "📊 Status"
+BTN_STATUS = "📊 My Status"
 BTN_HELP = "❓ Help"
 BTN_REQUEST = "🔑 Request Access"
-BTN_ADMIN = "🛠 Admin Panel"
-BTN_BACK = "🔙 Back"
-BTN_ADD_SERVER = "➕ Add Server"
-BTN_DEL_SERVER = "➖ Remove Server"
-BTN_SERVERS = "🖥 Server Status"
-BTN_APPROVE = "✅ Approve User"
-BTN_REVOKE = "🚫 Revoke / Ban"
-BTN_USERS = "👥 Users"
-BTN_BROADCAST = "📢 Broadcast"
-BTN_STATS = "📈 Stats"
-BTN_JOBS = "🧾 Jobs"
-ALL_BUTTONS = {BTN_CREATE, BTN_SETTINGS, BTN_PREVIEW, BTN_HISTORY, BTN_ACCOUNT, BTN_STATUS, BTN_HELP, BTN_REQUEST,
-               BTN_ADMIN, BTN_BACK, BTN_ADD_SERVER, BTN_DEL_SERVER, BTN_SERVERS, BTN_APPROVE, BTN_REVOKE, BTN_USERS,
-               BTN_BROADCAST, BTN_STATS, BTN_JOBS}
+BTN_ADMIN = "🛠 Admin"
+MAIN_BUTTONS: Dict[str, str] = {BTN_CREATE: "create", BTN_SETTINGS: "settings", BTN_STATUS: "status",
+                                BTN_HELP: "help", BTN_REQUEST: "request", BTN_ADMIN: "admin"}
+# Buttons of older keyboards that may still be cached in a user's Telegram app.
+LEGACY_BUTTONS: Dict[str, str] = {
+    "🔊 Voice Preview": "preview", "📜 History": "history", "👤 My Account": "status", "📊 Status": "status",
+    "🛠 Admin Panel": "admin", "🔙 Back": "home", "➕ Add Server": "adm_add", "➖ Remove Server": "adm_workers",
+    "🖥 Server Status": "adm_workers", "✅ Approve User": "adm_users", "🚫 Revoke / Ban": "adm_users",
+    "👥 Users": "adm_users", "📢 Broadcast": "adm_broadcast", "📈 Stats": "adm_stats", "🧾 Jobs": "adm_jobs",
+}
+ALL_BUTTONS = set(MAIN_BUTTONS) | set(LEGACY_BUTTONS)
+USER_COMMANDS = ["start", "help", "status", "queue", "account", "history", "settings", "preview", "cancel", "resume",
+                 "jobs", "admin", "servers", "users", "stats", "addserver", "add_server", "menu"]
 
 
 def main_keyboard(uid: int) -> ReplyKeyboardMarkup:
-    rows = [[KeyboardButton(BTN_CREATE), KeyboardButton(BTN_SETTINGS)],
-            [KeyboardButton(BTN_PREVIEW), KeyboardButton(BTN_HISTORY)],
-            [KeyboardButton(BTN_ACCOUNT), KeyboardButton(BTN_STATUS), KeyboardButton(BTN_HELP)]]
     if not db.is_approved(uid):
-        rows.insert(0, [KeyboardButton(BTN_REQUEST)])
-    if uid == OWNER_ID:
-        rows.append([KeyboardButton(BTN_ADMIN)])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+        rows = [[KeyboardButton(BTN_REQUEST), KeyboardButton(BTN_HELP)]]
+    else:
+        second = [KeyboardButton(BTN_STATUS)]
+        if uid == OWNER_ID:
+            second.append(KeyboardButton(BTN_ADMIN))
+        second.append(KeyboardButton(BTN_HELP))
+        rows = [[KeyboardButton(BTN_CREATE), KeyboardButton(BTN_SETTINGS)], second]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True,
+                               placeholder="Send a document or paste text…")
 
 
-def admin_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([
-        [KeyboardButton(BTN_ADD_SERVER), KeyboardButton(BTN_DEL_SERVER), KeyboardButton(BTN_SERVERS)],
-        [KeyboardButton(BTN_APPROVE), KeyboardButton(BTN_REVOKE), KeyboardButton(BTN_USERS)],
-        [KeyboardButton(BTN_BROADCAST), KeyboardButton(BTN_STATS), KeyboardButton(BTN_JOBS)],
-        [KeyboardButton(BTN_BACK)],
-    ], resize_keyboard=True)
+def ikb(rows: List[List[Tuple[str, str]]]) -> InlineKeyboardMarkup:
+    """Inline keyboard from [[(label, callback_data), ...], ...]."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in rows])
+
+
+CLOSE_ROW = [("✖️ Close", "close")]
 
 
 def settings_text(uid: int) -> str:
     s = db.settings(uid)
     return ("⚙️ <b>Settings</b>\n\n"
             f"🗣 Voice: <b>{html.escape(voice_label(s['voice']))}</b>\n"
-            f"⏩ Rate: <b>{s['rate']}</b> · 🎚 Pitch: <b>{s['pitch']}</b> · 🔉 Volume: <b>{s['volume']}</b>\n"
-            f"⏱ Max hours per part: <b>{s['hours']} h</b>\n"
-            f"✂️ Split: <b>{'by chapter' if s['split_mode'] == 'chapter' else 'by duration'}</b>")
+            f"⏩ Rate <b>{s['rate']}</b> · 🎚 Pitch <b>{s['pitch']}</b> · 🔉 Volume <b>{s['volume']}</b>\n"
+            f"⏱ Max <b>{s['hours']} h</b> per MP3 part · "
+            f"✂️ split <b>{'by chapter' if s['split_mode'] == 'chapter' else 'by duration'}</b>")
 
 
 def settings_markup(uid: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗣 Voice", callback_data="set:voice"),
-         InlineKeyboardButton("⏩ Rate", callback_data="set:rate")],
-        [InlineKeyboardButton("🎚 Pitch", callback_data="set:pitch"),
-         InlineKeyboardButton("🔉 Volume", callback_data="set:volume")],
-        [InlineKeyboardButton("⏱ Hours/part", callback_data="set:hours"),
-         InlineKeyboardButton("✂️ Split mode", callback_data="set:split")],
-        [InlineKeyboardButton("🔊 Preview", callback_data="preview"),
-         InlineKeyboardButton("↩️ Reset", callback_data="reset_settings")],
-        [InlineKeyboardButton("✖️ Close", callback_data="close")],
+    return ikb([
+        [("🗣 Voice", "set:voice"), ("⏩ Rate", "set:rate")],
+        [("🎚 Pitch", "set:pitch"), ("🔉 Volume", "set:volume")],
+        [("⏱ Hours/part", "set:hours"), ("✂️ Split mode", "set:split")],
+        [("🔊 Preview voice", "preview"), ("↩️ Reset", "reset_settings")],
+        CLOSE_ROW,
     ])
 
 
 def voice_groups_markup() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(g, callback_data=f"vg:{i}")] for i, g in enumerate(VOICE_GROUPS)]
-    rows.append([InlineKeyboardButton("✏️ Custom voice id", callback_data="voice_custom")])
-    rows.append([InlineKeyboardButton("🔙 Back", callback_data="back_settings")])
-    return InlineKeyboardMarkup(rows)
+    names = list(VOICE_GROUPS)
+    rows: List[List[Tuple[str, str]]] = []
+    for i in range(0, len(names), 2):
+        rows.append([(g, f"vg:{names.index(g)}") for g in names[i:i + 2]])
+    rows.append([("✏️ Custom voice id", "voice_custom"), ("🔙 Back", "back_settings")])
+    return ikb(rows)
 
 
 def voice_list_markup(group_index: int, current: str) -> InlineKeyboardMarkup:
     group = list(VOICE_GROUPS.keys())[group_index]
-    rows = []
-    for lbl, vid in VOICE_GROUPS[group]:
-        mark = "✅ " if vid == current else ""
-        rows.append([InlineKeyboardButton(f"{mark}{lbl}", callback_data=f"voice:{vid}")])
-    rows.append([InlineKeyboardButton("🔙 Back", callback_data="set:voice")])
-    return InlineKeyboardMarkup(rows)
+    items = VOICE_GROUPS[group]
+    rows: List[List[Tuple[str, str]]] = []
+    for i in range(0, len(items), 2):
+        rows.append([(("✅ " if vid == current else "") + lbl, f"voice:{vid}") for lbl, vid in items[i:i + 2]])
+    rows.append([("🔙 Back", "set:voice")])
+    return ikb(rows)
 
 
 def options_markup(prefix: str, options: List[Tuple[str, str]], current: str, cols: int = 3) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    row: List[InlineKeyboardButton] = []
+    rows: List[List[Tuple[str, str]]] = []
+    row: List[Tuple[str, str]] = []
     for lbl, val in options:
-        mark = "✅ " if val == current else ""
-        row.append(InlineKeyboardButton(f"{mark}{lbl}", callback_data=f"{prefix}:{val}"))
+        row.append((("✅ " if val == current else "") + lbl, f"{prefix}:{val}"))
         if len(row) == cols:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("🔙 Back", callback_data="back_settings")])
-    return InlineKeyboardMarkup(rows)
+    rows.append([("🔙 Back", "back_settings")])
+    return ikb(rows)
 
 
-def approval_markup(target: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("7 days", callback_data=f"approve:{target}:7"),
-         InlineKeyboardButton("30 days", callback_data=f"approve:{target}:30"),
-         InlineKeyboardButton("90 days", callback_data=f"approve:{target}:90")],
-        [InlineKeyboardButton("♾ Lifetime", callback_data=f"approve:{target}:0"),
-         InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{target}")],
+def approval_markup(target: int, prefix: str = "approve", ban_prefix: str = "ban") -> InlineKeyboardMarkup:
+    return ikb([
+        [("7 days", f"{prefix}:{target}:7"), ("30 days", f"{prefix}:{target}:30"),
+         ("90 days", f"{prefix}:{target}:90")],
+        [("♾ Lifetime", f"{prefix}:{target}:0"), ("🚫 Ban", f"{ban_prefix}:{target}")],
     ])
 
 
 HELP_TEXT = (
-    "❓ <b>How to use</b>\n\n"
-    "1. Send a document (.txt .md .docx .html .epub .pdf, up to {mb} MB) or paste text.\n"
-    "2. Confirm with <b>🎧 Create Audio</b>.\n"
-    "3. Receive MP3 part(s) - long books are split into parts of at most N hours "
-    "(Settings → Hours/part) or by chapter.\n\n"
+    "❓ <b>How it works</b>\n\n"
+    "1️⃣ Send a document (<code>.txt .md .docx .html .epub .pdf</code>, up to {mb} MB) or paste text.\n"
+    "2️⃣ Confirm - I split the book, voice it in parallel and send MP3 part(s) "
+    "(max N hours each, or one per chapter - see Settings).\n"
+    "3️⃣ Watch the live card: Queue › Prepare › Voice › Send › Done, with %, speed and ETA.\n\n"
     "<b>Commands</b>\n"
-    "/settings - voice, rate, pitch, volume, split mode\n"
-    "/preview - short voice sample\n"
-    "/cancel - stop your current or queued job\n"
-    "/queue - job queue and your position\n"
-    "/resume - continue an interrupted job\n"
-    "/history · /account · /status · /help\n"
+    "/settings voice, rate, pitch, volume, split\n"
+    "/preview hear the selected voice\n"
+    "/status your job, account, history\n"
+    "/cancel stop your current job\n"
+    "/resume continue an interrupted job\n"
+    "/queue · /history · /help"
 )
+
+
+def help_markup(uid: int) -> InlineKeyboardMarkup:
+    rows = [[("⚙️ Settings", "back_settings"), ("🔊 Preview voice", "preview")]]
+    if not db.is_approved(uid):
+        rows = [[("🔑 Request access", "request")]]
+    rows.append(CLOSE_ROW)
+    return ikb(rows)
 
 
 def is_admin(uid: int) -> bool:
@@ -2171,152 +2399,237 @@ async def deny(message: Message) -> None:
         reply_markup=main_keyboard(message.from_user.id))
 
 
+def _user_line(u) -> str:
+    return html.escape(u.first_name or u.username or str(u.id))
+
+
+# =============================================================================
+# Status card (account + current job + queue) - one message, inline actions
+# =============================================================================
+def job_summary_line(job: Job) -> str:
+    stage = dict(JOB_STAGES).get(job.stage, job.stage)
+    if job.running:
+        st = f"{job.status_line or 'starting'} · {stage}"
+    else:
+        st = f"queued #{job_queue.position(job)} · starts in ~{fmt_duration(job_queue.eta_seconds(job))}"
+    return f"▶️ <b>{html.escape(job.title[:40])}</b> - {st}"
+
+
+def status_text(uid: int, username: Optional[str] = None, first_name: Optional[str] = None) -> str:
+    row = db.ensure_user(uid, username, first_name)
+    if uid == OWNER_ID:
+        access = "👑 owner"
+    elif db.is_approved(uid):
+        access = f"✅ approved until {row['expiry'][:10]}" if row["expiry"] else "✅ approved (lifetime)"
+    elif row["banned"]:
+        access = "🚫 banned"
+    elif db.one("SELECT 1 FROM requests WHERE user_id=?", (uid,)):
+        access = "⏳ request pending"
+    else:
+        access = "🔒 not approved"
+    r_cnt, w_cnt = job_queue.counts()
+    lines = ["📊 <b>My Status</b>",
+             f"👤 <code>{uid}</code> · {access}",
+             f"📚 {row['total_jobs'] or 0} audiobooks · {(row['total_chars'] or 0):,} chars · "
+             f"{fmt_duration(row['total_seconds'] or 0)} audio", ""]
+    job = current_job(uid)
+    if job:
+        lines.append(job_summary_line(job))
+    else:
+        resumable = [r for r in db.unfinished_jobs() if r["user_id"] == uid]
+        if resumable:
+            r = resumable[0]
+            lines.append(f"💤 Interrupted: <b>{html.escape((r['title'] or '')[:40])}</b> "
+                         f"({r['cursor'] or 0}/{r['chunks'] or '?'} chunks) - press Resume")
+        else:
+            lines.append("💤 No job running - send a document or text to start.")
+    lines.append("")
+    lines.append(f"🖥 Workers online {len(pool.usable())}/{len(pool.states())} · "
+                 f"🧾 queue {r_cnt} running · {w_cnt} waiting")
+    return "\n".join(lines)
+
+
+def status_markup(uid: int) -> InlineKeyboardMarkup:
+    rows: List[List[Tuple[str, str]]] = []
+    job = current_job(uid)
+    if job:
+        rows.append([("⛔ Cancel my job", f"canceljob:{job.job_id}"), ("🧾 Queue", "queue")])
+    else:
+        resumable = [r for r in db.unfinished_jobs() if r["user_id"] == uid]
+        if resumable:
+            rows.append([("🔄 Resume", "resume"), ("🧾 Queue", "queue")])
+        else:
+            rows.append([("🧾 Queue", "queue")])
+    rows.append([("📜 History", "history"), ("🔊 Preview voice", "preview")])
+    rows.append([("🔄 Refresh", "status")] + CLOSE_ROW)
+    return ikb(rows)
+
+
+def history_text(uid: int) -> str:
+    rows = db.user_history(uid, 12)
+    if not rows:
+        return "📜 <b>History</b>\n\nNo audiobooks yet."
+    lines = ["📜 <b>Recent audiobooks</b>"]
+    for r in rows:
+        icon = {"done": "✅", "failed": "❌", "cancelled": "⛔", "running": "▶️", "paused": "⏸",
+                "queued": "🕒", "interrupted": "💤"}.get(r["status"], "•")
+        extra = f" · {fmt_duration(r['duration'])} · {r['parts']} part(s)" if r["status"] == "done" else f" · {r['status']}"
+        lines.append(f"{icon} #{r['id']} {html.escape((r['title'] or '')[:32])} · {(r['chars'] or 0):,} ch{extra}"
+                     f"\n      <i>{(r['created'] or '')[:16]}</i>")
+    return "\n".join(lines)
+
+
+def queue_text(uid: int) -> str:
+    r_cnt, w_cnt = job_queue.counts()
+    lines = [f"🧾 <b>Job queue</b> · {r_cnt}/{job_queue.parallel} running · {w_cnt} waiting"]
+    if not job_queue.running and not job_queue.waiting:
+        lines.append("\nThe queue is empty - your job would start immediately.")
+    for j in job_queue.running:
+        who = f"user {j.user_id}" if is_admin(uid) else ("you" if j.user_id == uid else "another user")
+        lines.append(f"▶️ {who}: {html.escape(j.title[:30])} · {j.status_line or 'starting'}")
+    for n, j in enumerate(job_queue.waiting, 1):
+        who = f"user {j.user_id}" if is_admin(uid) else ("you" if j.user_id == uid else "another user")
+        lines.append(f"#{n} {who}: {html.escape(j.title[:30])} · {j.chars:,} chars · ~{fmt_duration(job_queue.eta_seconds(j))}")
+    return "\n".join(lines)
+
+
+BACK_STATUS = [("🔙 Back", "status")] + CLOSE_ROW
+
+
 # =============================================================================
 # Basic commands
 # =============================================================================
-@bot.on_message(filters.command("start") & filters.private)
+@bot.on_message(filters.command(["start", "menu"]) & filters.private)
 async def cmd_start(client: Client, message: Message):
     u = message.from_user
     db.ensure_user(u.id, u.username, u.first_name)
+    admin_states.pop(u.id, None)
     approved = db.is_approved(u.id)
-    txt = (f"👋 Hello <b>{html.escape(u.first_name or 'there')}</b>!\n\n"
+    txt = (f"👋 Hello <b>{_user_line(u)}</b>!\n\n"
            "I turn books, stories and documents into <b>MP3 audiobooks</b> with natural neural voices "
            "(Hindi, English and other Indian languages).\n\n")
-    txt += ("Send me a document or some text to begin." if approved
-            else f"Access is by approval - press <b>{BTN_REQUEST}</b> to ask the owner.")
+    if approved:
+        txt += "📄 Send me a document or paste some text to begin."
+        if is_admin(u.id) and not db.servers():
+            txt += "\n\n⚠️ No TTS Worker registered yet - open <b>🛠 Admin → Workers → ➕ Add</b>."
+    else:
+        txt += f"Access is by approval - press <b>{BTN_REQUEST}</b> to ask the owner."
     await message.reply_text(txt, reply_markup=main_keyboard(u.id))
 
 
 @bot.on_message(filters.command("help") & filters.private)
 async def cmd_help(client: Client, message: Message):
-    await message.reply_text(HELP_TEXT.format(mb=MAX_FILE_MB), reply_markup=main_keyboard(message.from_user.id))
+    await message.reply_text(HELP_TEXT.format(mb=MAX_FILE_MB), reply_markup=help_markup(message.from_user.id))
 
 
-@bot.on_message(filters.regex(f"^{re.escape(BTN_HELP)}$") & filters.private)
-async def btn_help(client: Client, message: Message):
-    await cmd_help(client, message)
+@bot.on_callback_query(filters.regex(r"^help$"))
+async def cb_help(client: Client, cq: CallbackQuery):
+    await safe_edit(cq.message, HELP_TEXT.format(mb=MAX_FILE_MB), help_markup(cq.from_user.id))
+    await cq.answer()
 
 
-@bot.on_message((filters.command("status") | filters.regex(f"^{re.escape(BTN_STATUS)}$")) & filters.private)
+@bot.on_message(filters.command(["status", "account"]) & filters.private)
 async def cmd_status(client: Client, message: Message):
-    uid = message.from_user.id
-    r_cnt, w_cnt = job_queue.counts()
-    srv = pool.states()
-    usable = len(pool.usable())
-    txt = (f"📊 <b>Status</b> · bot v{VERSION}\n\n"
-           f"TTS Workers: {usable}/{len(srv)} usable\n"
-           f"Jobs: running {r_cnt} · waiting {w_cnt}\n"
-           f"ffmpeg: {'yes' if FFMPEG else 'no'}\n")
-    mine = active_jobs.get(uid)
-    if mine:
-        state = "running" if mine.running else f"queued #{job_queue.position(mine)}"
-        txt += f"\nYour job: <b>{html.escape(mine.title[:40])}</b> - {state} {mine.status_line}"
-    if is_admin(uid) and srv:
-        txt += "\n\n" + "\n".join(html.escape(s.describe()) for s in srv)
-    await message.reply_text(txt)
+    u = message.from_user
+    await message.reply_text(status_text(u.id, u.username, u.first_name), reply_markup=status_markup(u.id))
+
+
+@bot.on_callback_query(filters.regex(r"^status$"))
+async def cb_status(client: Client, cq: CallbackQuery):
+    u = cq.from_user
+    await safe_edit(cq.message, status_text(u.id, u.username, u.first_name), status_markup(u.id))
+    await cq.answer()
 
 
 @bot.on_message(filters.command("queue") & filters.private)
 async def cmd_queue(client: Client, message: Message):
-    uid = message.from_user.id
-    r_cnt, w_cnt = job_queue.counts()
-    lines = [f"🧾 <b>Job queue</b> - running {r_cnt}/{job_queue.parallel} · waiting {w_cnt}"]
-    for j in job_queue.running:
-        who = f"user {j.user_id}" if is_admin(uid) else ("you" if j.user_id == uid else "another user")
-        lines.append(f"▶️ {who}: {html.escape(j.title[:30])} {j.status_line}")
-    for n, j in enumerate(job_queue.waiting, 1):
-        who = f"user {j.user_id}" if is_admin(uid) else ("you" if j.user_id == uid else "another user")
-        eta = fmt_duration(job_queue.eta_seconds(j))
-        lines.append(f"#{n} {who}: {html.escape(j.title[:30])} · {j.chars:,} chars · ~{eta}")
-    await message.reply_text("\n".join(lines))
+    await message.reply_text(queue_text(message.from_user.id), reply_markup=ikb([BACK_STATUS]))
 
 
-@bot.on_message(filters.regex(f"^{re.escape(BTN_REQUEST)}$") & filters.private)
-async def request_access(client: Client, message: Message):
-    u = message.from_user
+@bot.on_callback_query(filters.regex(r"^queue$"))
+async def cb_queue(client: Client, cq: CallbackQuery):
+    await safe_edit(cq.message, queue_text(cq.from_user.id), ikb([[("🔄 Refresh", "queue")], BACK_STATUS]))
+    await cq.answer()
+
+
+@bot.on_message(filters.command("history") & filters.private)
+async def cmd_history(client: Client, message: Message):
+    await message.reply_text(history_text(message.from_user.id), reply_markup=ikb([BACK_STATUS]))
+
+
+@bot.on_callback_query(filters.regex(r"^history$"))
+async def cb_history(client: Client, cq: CallbackQuery):
+    await safe_edit(cq.message, history_text(cq.from_user.id), ikb([BACK_STATUS]))
+    await cq.answer()
+
+
+async def request_access(client: Client, u, reply) -> None:
     db.ensure_user(u.id, u.username, u.first_name)
     if db.is_approved(u.id):
-        await message.reply_text("✅ You are already approved.", reply_markup=main_keyboard(u.id))
+        await reply("✅ You are already approved.", reply_markup=main_keyboard(u.id))
         return
     row = db.user(u.id)
     if row and row["banned"]:
-        await message.reply_text("🚫 Your access has been blocked.")
+        await reply("🚫 Your access has been blocked.")
         return
     if db.one("SELECT 1 FROM requests WHERE user_id=?", (u.id,)):
-        await message.reply_text("⏳ Your request is already pending. Please wait for the owner.")
+        await reply("⏳ Your request is already pending. Please wait for the owner.")
         return
     db.x("INSERT OR REPLACE INTO requests(user_id, requested) VALUES (?,?)", (u.id, now_str()))
-    await message.reply_text("📨 Request sent. You will be notified when approved.")
+    await reply("📨 Request sent. You will be notified when approved.")
     if OWNER_ID:
         await safe_send(client, OWNER_ID,
-                        f"🔑 <b>Access request</b>\n{html.escape(u.first_name or '')} "
-                        f"(@{u.username or '-'}) · <code>{u.id}</code>",
+                        f"🔑 <b>Access request</b>\n{_user_line(u)} (@{u.username or '-'}) · <code>{u.id}</code>",
                         reply_markup=approval_markup(u.id))
+
+
+@bot.on_callback_query(filters.regex(r"^request$"))
+async def cb_request(client: Client, cq: CallbackQuery):
+    await cq.answer()
+
+    async def reply(text: str, **kw):
+        await safe_send(client, cq.message.chat.id, text, **kw)
+
+    await request_access(client, cq.from_user, reply)
 
 
 async def grant_access(client: Client, target: int, days: int) -> str:
     db.ensure_user(target, None, None)
     db.approve(target, days)
     until = "lifetime" if days == 0 else f"{days} days"
-    await safe_send(client, target, f"✅ Your access has been approved ({until}). Send /start to begin.")
-    return f"✅ User {target} approved for {until}."
+    await safe_send(client, target, f"✅ Your access has been approved ({until}). Send /start to begin.",
+                    reply_markup=main_keyboard(target))
+    return f"✅ User <code>{target}</code> approved ({until})."
+
+
+async def ban_user(client: Client, target: int) -> str:
+    db.ensure_user(target, None, None)
+    db.revoke(target, ban=True)
+    db.x("DELETE FROM requests WHERE user_id=?", (target,))
+    j = active_jobs.get(target)
+    if j:
+        j.cancel.set()
+    await safe_send(client, target, "🚫 Your access request was declined.")
+    return f"🚫 User <code>{target}</code> banned."
 
 
 @bot.on_callback_query(filters.regex(r"^(approve|ban):"))
 async def cb_approval(client: Client, cq: CallbackQuery):
+    """Buttons under the 'access request' notification the owner receives."""
     if not is_admin(cq.from_user.id):
         await cq.answer("Owner only", show_alert=True)
         return
     parts = cq.data.split(":")
     target = int(parts[1])
-    if parts[0] == "ban":
-        db.ensure_user(target, None, None)
-        db.revoke(target, ban=True)
-        db.x("DELETE FROM requests WHERE user_id=?", (target,))
-        await safe_send(client, target, "🚫 Your access request was declined.")
-        await cq.message.edit_text(f"🚫 User {target} banned.")
-    else:
-        msg = await grant_access(client, target, int(parts[2]))
-        await cq.message.edit_text(msg)
-    await cq.answer()
-
-
-@bot.on_message((filters.command("account") | filters.regex(f"^{re.escape(BTN_ACCOUNT)}$")) & filters.private)
-async def my_account(client: Client, message: Message):
-    u = message.from_user
-    row = db.ensure_user(u.id, u.username, u.first_name)
-    if db.is_approved(u.id):
-        exp = row["expiry"] or ("lifetime" if u.id != OWNER_ID else "owner")
-        status = f"✅ approved (until {exp})"
-    elif row["banned"]:
-        status = "🚫 banned"
-    else:
-        status = "⏳ not approved"
-    await message.reply_text(
-        f"👤 <b>Account</b>\nID: <code>{u.id}</code>\nStatus: {status}\n"
-        f"Joined: {row['joined']}\n\n"
-        f"Audiobooks: {row['total_jobs']} · {row['total_chars']:,} chars · {fmt_duration(row['total_seconds'] or 0)}")
-
-
-@bot.on_message((filters.command("history") | filters.regex(f"^{re.escape(BTN_HISTORY)}$")) & filters.private)
-async def my_history(client: Client, message: Message):
-    rows = db.user_history(message.from_user.id)
-    if not rows:
-        await message.reply_text("📜 No audiobooks yet.")
-        return
-    lines = ["📜 <b>Recent audiobooks</b>"]
-    for r in rows:
-        icon = {"done": "✅", "failed": "❌", "cancelled": "⛔", "running": "▶️", "paused": "⏸",
-                "queued": "🕒", "interrupted": "💤"}.get(r["status"], "•")
-        lines.append(f"{icon} #{r['id']} {html.escape((r['title'] or '')[:35])} · {(r['chars'] or 0):,} chars"
-                     f" · {fmt_duration(r['duration'] or 0)} · {r['created'][:16]}")
-    await message.reply_text("\n".join(lines))
+    msg = await (ban_user(client, target) if parts[0] == "ban" else grant_access(client, target, int(parts[2])))
+    await safe_edit(cq.message, msg)
+    await cq.answer("Done")
 
 
 # =============================================================================
 # Settings
 # =============================================================================
-@bot.on_message((filters.command("settings") | filters.regex(f"^{re.escape(BTN_SETTINGS)}$")) & filters.private)
+@bot.on_message(filters.command("settings") & filters.private)
 async def open_settings(client: Client, message: Message):
     uid = message.from_user.id
     db.ensure_user(uid, message.from_user.username, message.from_user.first_name)
@@ -2332,8 +2645,14 @@ async def cb_back_settings(client: Client, cq: CallbackQuery):
 
 @bot.on_callback_query(filters.regex(r"^close$"))
 async def cb_close(client: Client, cq: CallbackQuery):
+    admin_states.pop(cq.from_user.id, None)
     with contextlib.suppress(Exception):
         await cq.message.delete()
+    await cq.answer()
+
+
+@bot.on_callback_query(filters.regex(r"^noop$"))
+async def cb_noop(client: Client, cq: CallbackQuery):
     await cq.answer()
 
 
@@ -2343,18 +2662,21 @@ async def cb_set(client: Client, cq: CallbackQuery):
     what = cq.data.split(":", 1)[1]
     s = db.settings(uid)
     if what == "voice":
-        await safe_edit(cq.message, "🗣 <b>Choose a voice group</b>", voice_groups_markup())
+        await safe_edit(cq.message, f"🗣 <b>Choose a voice</b>\nCurrent: {html.escape(voice_label(s['voice']))}",
+                        voice_groups_markup())
     elif what == "rate":
         await safe_edit(cq.message, "⏩ <b>Speaking rate</b>", options_markup("rate", RATE_OPTIONS, s["rate"]))
     elif what == "pitch":
         await safe_edit(cq.message, "🎚 <b>Pitch</b>", options_markup("pitch", PITCH_OPTIONS, s["pitch"]))
     elif what == "volume":
-        await safe_edit(cq.message, "🔉 <b>Volume</b>", options_markup("volume", VOLUME_OPTIONS, s["volume"]))
+        await safe_edit(cq.message, "🔉 <b>Volume</b>", options_markup("volume", VOLUME_OPTIONS, s["volume"], cols=4))
     elif what == "hours":
-        await safe_edit(cq.message, "⏱ <b>Maximum hours per MP3 part</b>",
+        await safe_edit(cq.message, "⏱ <b>Maximum hours per MP3 part</b>\nLong books are split into parts of this length.",
                         options_markup("hours", HOURS_OPTIONS, str(s["hours"])))
     elif what == "split":
-        await safe_edit(cq.message, "✂️ <b>How to split long books</b>",
+        await safe_edit(cq.message, "✂️ <b>How to split long books</b>\n"
+                                    "<b>By duration</b> - parts of at most N hours.\n"
+                                    "<b>By chapter</b> - one part per detected chapter heading.",
                         options_markup("split_mode", [("By duration", "duration"), ("By chapter", "chapter")],
                                        s["split_mode"], cols=2))
     await cq.answer()
@@ -2387,8 +2709,8 @@ async def cb_voice_custom(client: Client, cq: CallbackQuery):
     admin_states[cq.from_user.id] = "custom_voice"
     await safe_edit(cq.message,
                     "✏️ Send a voice id, e.g. <code>en-US-AndrewNeural</code> or <code>hi-IN-SwaraNeural</code>.\n"
-                    "Full list: the Worker's <code>/voices</code> endpoint. Send /cancel to abort.",
-                    InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_settings")]]))
+                    "Full list: the Worker's <code>/voices</code> endpoint.",
+                    ikb([[("🔙 Cancel", "back_settings")]]))
     await cq.answer()
 
 
@@ -2403,7 +2725,7 @@ async def cb_apply_option(client: Client, cq: CallbackQuery):
         return
     db.set_setting(cq.from_user.id, key, int(val) if key == "hours" else val)
     await safe_edit(cq.message, settings_text(cq.from_user.id), settings_markup(cq.from_user.id))
-    await cq.answer("Saved")
+    await cq.answer("Saved ✓")
 
 
 @bot.on_callback_query(filters.regex(r"^reset_settings$"))
@@ -2431,11 +2753,11 @@ PREVIEW_TEXTS = {
 }
 
 
-async def send_voice_preview(client: Client, chat_id: int, uid: int, status: Optional[Message] = None) -> None:
+async def send_voice_preview(client: Client, chat_id: int, uid: int) -> None:
     s = db.settings(uid)
     text = PREVIEW_TEXTS.get(voice_language(s["voice"]), PREVIEW_TEXTS["en"])
-    if status is None:
-        status = await safe_send(client, chat_id, "🔊 Generating preview...")
+    status = await safe_send(client, chat_id, f"🔊 <b>Voice preview</b>\n🗣 {html.escape(voice_label(s['voice']))}\n\n"
+                                              f"🔍 Checking Workers…")
     if http_session is None:
         await safe_edit(status, "❌ Bot is still starting, try again in a moment.")
         return
@@ -2445,21 +2767,26 @@ async def send_voice_preview(client: Client, chat_id: int, uid: int, status: Opt
         if not pool.usable():
             await pool.refresh(http_session)
         if not pool.states():
-            raise RuntimeError("No TTS Worker registered yet.")
+            raise RuntimeError("No TTS Worker registered yet - the admin has to add one (🛠 Admin → Workers).")
+        await safe_edit(status, f"🔊 <b>Voice preview</b>\n🗣 {html.escape(voice_label(s['voice']))}\n\n"
+                                f"🎙 Synthesising sample…")
         data, dur, _ = await fetch_chunk(http_session, pool, text, 0, s, asyncio.Event())
+        await safe_edit(status, f"🔊 <b>Voice preview</b>\n🗣 {html.escape(voice_label(s['voice']))}\n\n📤 Sending…")
         tmp = os.path.join(tempfile.gettempdir(), f"preview_{uid}_{uuid.uuid4().hex[:6]}.mp3")
         with open(tmp, "wb") as fh:
             fh.write(data)
         try:
             await client.send_audio(chat_id, tmp, caption=f"🔊 {html.escape(voice_label(s['voice']))} · rate {s['rate']}",
-                                    title="Voice preview", performer="AudioBook Pro", duration=int(dur / 1000))
+                                    title="Voice preview", performer="AudioBook Pro", duration=int(dur / 1000),
+                                    reply_markup=ikb([[("🗣 Change voice", "set:voice"), ("🎧 Create audio", "new")]]))
         finally:
             with contextlib.suppress(OSError):
                 os.remove(tmp)
         with contextlib.suppress(Exception):
             await status.delete()
     except Exception as e:  # noqa: BLE001
-        await safe_edit(status, f"❌ Preview failed: {html.escape(str(e)[:200])}")
+        await safe_edit(status, f"❌ <b>Preview failed</b>\n{html.escape(str(e)[:200])}",
+                        ikb([[("🔁 Retry", "preview")] + CLOSE_ROW]))
 
 
 async def start_preview(client: Client, chat_id: int, uid: int) -> None:
@@ -2479,7 +2806,7 @@ async def cb_preview(client: Client, cq: CallbackQuery):
     await start_preview(client, cq.message.chat.id, cq.from_user.id)
 
 
-@bot.on_message((filters.command("preview") | filters.regex(f"^{re.escape(BTN_PREVIEW)}$")) & filters.private)
+@bot.on_message(filters.command("preview") & filters.private)
 async def cmd_preview(client: Client, message: Message):
     if not db.is_approved(message.from_user.id):
         await deny(message)
@@ -2490,14 +2817,26 @@ async def cmd_preview(client: Client, message: Message):
 # =============================================================================
 # Create / cancel
 # =============================================================================
-@bot.on_message(filters.regex(f"^{re.escape(BTN_CREATE)}$") & filters.private)
-async def btn_create(client: Client, message: Message):
-    if not db.is_approved(message.from_user.id):
-        await deny(message)
+CREATE_PROMPT = (f"📄 <b>Send me the text to narrate</b>\n\n"
+                 f"• a document: <code>.txt .md .docx .html .epub .pdf</code> (up to {MAX_FILE_MB} MB)\n"
+                 "• or simply paste / forward the text\n\n"
+                 "You will see every step live: download → extract → split → voice → send.")
+
+
+@bot.on_callback_query(filters.regex(r"^new$"))
+async def cb_new(client: Client, cq: CallbackQuery):
+    if not db.is_approved(cq.from_user.id):
+        await cq.answer("Not approved", show_alert=True)
         return
-    await message.reply_text(
-        f"📄 Send me a document (.txt .md .docx .html .epub .pdf, up to {MAX_FILE_MB} MB) "
-        "or paste the text you want narrated.")
+    await cq.answer()
+    await safe_send(client, cq.message.chat.id, CREATE_PROMPT)
+
+
+async def busy_reply(client: Client, chat_id: int, job: Job) -> None:
+    await safe_send(client, chat_id,
+                    f"⏳ <b>You already have a job</b>\n{job_summary_line(job)}\n\n"
+                    "Wait for it to finish or cancel it first.",
+                    reply_markup=ikb([[("⛔ Cancel it", f"canceljob:{job.job_id}"), ("📊 Status", "status")]]))
 
 
 @bot.on_message(filters.command("cancel") & filters.private)
@@ -2509,19 +2848,19 @@ async def cmd_cancel(client: Client, message: Message):
     if pending_text.pop(uid, None):
         await message.reply_text("Pending text discarded.")
         return
-    job = active_jobs.get(uid)
+    job = current_job(uid)
     if not job:
         await message.reply_text("Nothing to cancel.")
         return
     job.cancel.set()
     await job_queue.kick()
-    await message.reply_text("⛔ Cancelling your job...")
+    await message.reply_text("⛔ Cancelling your job…")
 
 
 @bot.on_callback_query(filters.regex(r"^canceljob:"))
 async def cb_cancel_job(client: Client, cq: CallbackQuery):
     uid = cq.from_user.id
-    job = active_jobs.get(uid)
+    job = current_job(uid)
     if not job and is_admin(uid):
         jid = int(cq.data.split(":")[1] or 0)
         job = next((j for j in active_jobs.values() if j.job_id == jid), None)
@@ -2534,7 +2873,7 @@ async def cb_cancel_job(client: Client, cq: CallbackQuery):
 
 
 # =============================================================================
-# Text & document intake
+# Text & document intake (every step visible in one status message)
 # =============================================================================
 def _title_from_text(text: str) -> str:
     first = text.strip().split("\n", 1)[0].strip()
@@ -2542,25 +2881,36 @@ def _title_from_text(text: str) -> str:
     return (first[:50] or "Text").strip()
 
 
+def intake_card(title: str, meta: str, step: str) -> str:
+    return f"📄 <b>{html.escape(title[:60])}</b>\n{meta}\n\n{step}"
+
+
 async def start_job_from_file(client: Client, chat_id: int, uid: int, text_path: str, title: str,
-                              chars: int) -> None:
+                              chars: int, status: Optional[Message] = None) -> None:
     job = reserve_job(uid, title, chars)
     if job is None:
         with contextlib.suppress(OSError):
             os.remove(text_path)
-        if uid in active_jobs:
-            await safe_send(client, chat_id, "⏳ You already have a job running or queued. /cancel it first.")
+        with contextlib.suppress(Exception):
+            if status:
+                await status.delete()
+        cur = current_job(uid)
+        if cur:
+            await busy_reply(client, chat_id, cur)
         else:
             await safe_send(client, chat_id, "🚦 The queue is full right now, please try again later.")
         return
     settings = db.settings(uid)
     settings["voice_requested"] = settings["voice"]
     est = fmt_duration(estimate_seconds(chars, settings["rate"]))
-    status = await safe_send(
-        client, chat_id,
-        f"📚 <b>{html.escape(title[:60])}</b>\n{chars:,} characters · ≈ {est} of audio\n"
-        f"🗣 {html.escape(voice_label(settings['voice']))}\n\nStarting...",
-        reply_markup=cancel_markup(0))
+    text = (f"🎧 <b>{html.escape(title[:60])}</b>\n{stage_line('queued')}\n\n"
+            f"📝 {chars:,} characters · ≈ {est} of audio\n"
+            f"🗣 {html.escape(voice_label(settings['voice']))} · ⏱ ≤ {settings['hours']} h per part\n\n"
+            "🚀 Starting…")
+    if status is not None:
+        await safe_edit(status, text, cancel_markup(0))
+    else:
+        status = await safe_send(client, chat_id, text, reply_markup=cancel_markup(0))
     job.task = asyncio.create_task(
         run_audiobook_job(client, status, uid, job, text_path, title, settings, chat_id=chat_id))
 
@@ -2576,22 +2926,37 @@ async def handle_document(client: Client, message: Message):
     name = doc.file_name or "document.txt"
     ext = os.path.splitext(name)[1].lower()
     if ext not in SUPPORTED_EXT:
-        await message.reply_text(f"❌ Unsupported file type <b>{html.escape(ext or '?')}</b>. "
-                                 f"Supported: {' '.join(sorted(SUPPORTED_EXT))}")
+        await message.reply_text(f"❌ Unsupported file type <b>{html.escape(ext or '?')}</b>.\n"
+                                 f"Supported: <code>{' '.join(sorted(SUPPORTED_EXT))}</code>")
         return
-    if (doc.file_size or 0) > MAX_FILE_MB * 1024 * 1024:
+    size = doc.file_size or 0
+    if size > MAX_FILE_MB * 1024 * 1024:
         await message.reply_text(f"❌ File is larger than {MAX_FILE_MB} MB.")
         return
-    if uid in active_jobs:
-        await message.reply_text("⏳ You already have a job running or queued. /cancel it first.")
+    cur = current_job(uid)
+    if cur:
+        await busy_reply(client, message.chat.id, cur)
         return
-    status = await message.reply_text("⬇️ Downloading...")
+    title = os.path.splitext(name)[0][:60] or "Document"
+    meta = f"{html.escape(ext)} · {fmt_size(size)}"
+    status = await message.reply_text(intake_card(title, meta, f"⬇️ Downloading… {progress_bar(0)} 0%"))
     os.makedirs(JOBS_DIR, exist_ok=True)
     src = os.path.join(JOBS_DIR, f"src_{uid}_{uuid.uuid4().hex[:8]}{ext}")
     txt_path = src + ".txt"
+    last = [0.0]
+
+    async def dl_progress(cur_b: int, tot_b: int) -> None:
+        now = time.time()
+        if now - last[0] < 2.0 and cur_b < tot_b:
+            return
+        last[0] = now
+        pct = int(100 * cur_b / max(1, tot_b))
+        await safe_edit(status, intake_card(title, meta, f"⬇️ Downloading… {progress_bar(pct)} {pct}%  "
+                                                         f"({fmt_size(cur_b)} / {fmt_size(tot_b)})"))
+
     try:
-        await message.download(file_name=src)
-        await safe_edit(status, "📖 Extracting text...")
+        await message.download(file_name=src, progress=dl_progress)
+        await safe_edit(status, intake_card(title, meta, f"✅ Downloaded\n📖 Extracting text from {html.escape(ext)}…"))
         chars = await asyncio.to_thread(extract_text_to_file, src, ext, txt_path)
         if chars < 5:
             raise ValueError("No readable text found in this file (scanned PDF?)")
@@ -2600,20 +2965,55 @@ async def handle_document(client: Client, message: Message):
         for p in (src, txt_path):
             with contextlib.suppress(OSError):
                 os.remove(p)
-        await safe_edit(status, f"❌ Could not read the file: {html.escape(str(e)[:200])}")
+        await safe_edit(status, intake_card(title, meta, f"❌ <b>Could not read the file</b>\n{html.escape(str(e)[:200])}"))
         return
     finally:
         with contextlib.suppress(OSError):
             os.remove(src)
-    with contextlib.suppress(Exception):
-        await status.delete()
-    title = os.path.splitext(name)[0][:60] or "Document"
-    await start_job_from_file(client, message.chat.id, uid, txt_path, title, chars)
+    await safe_edit(status, intake_card(title, meta, f"✅ Downloaded\n✅ Extracted {chars:,} characters\n🚀 Starting job…"))
+    await start_job_from_file(client, message.chat.id, uid, txt_path, title, chars, status=status)
 
 
-@bot.on_message(filters.text & filters.private & ~filters.command(
-    ["start", "help", "status", "queue", "account", "history", "settings", "preview", "cancel", "resume", "jobs",
-     "admin", "servers", "users", "stats", "addserver", "add_server"]))
+_button_filter = filters.create(lambda _, __, m: bool(m.text) and m.text in ALL_BUTTONS)
+
+
+@bot.on_message(filters.text & filters.private & _button_filter)
+async def reply_button_dispatch(client: Client, message: Message):
+    """Reply-keyboard buttons (current and legacy ones)."""
+    u = message.from_user
+    uid = u.id
+    db.ensure_user(uid, u.username, u.first_name)
+    admin_states.pop(uid, None)
+    action = MAIN_BUTTONS.get(message.text) or LEGACY_BUTTONS.get(message.text, "home")
+    if action == "create":
+        if not db.is_approved(uid):
+            await deny(message)
+            return
+        await message.reply_text(CREATE_PROMPT, reply_markup=main_keyboard(uid))
+    elif action == "settings":
+        await open_settings(client, message)
+    elif action == "status":
+        await cmd_status(client, message)
+    elif action == "help":
+        await cmd_help(client, message)
+    elif action == "request":
+        await request_access(client, u, message.reply_text)
+    elif action == "preview":
+        await cmd_preview(client, message)
+    elif action == "history":
+        await cmd_history(client, message)
+    elif action.startswith("adm") or action == "admin":
+        if not is_admin(uid):
+            await message.reply_text("Main menu", reply_markup=main_keyboard(uid))
+            return
+        page = {"adm_add": "wadd", "adm_workers": "workers", "adm_users": "users", "adm_broadcast": "bcast",
+                "adm_stats": "stats", "adm_jobs": "jobs"}.get(action, "home")
+        await admin_open(client, message, page)
+    else:  # home / legacy back
+        await message.reply_text("🏠 Main menu", reply_markup=main_keyboard(uid))
+
+
+@bot.on_message(filters.text & filters.private & ~_button_filter & ~filters.command(USER_COMMANDS))
 async def text_handler(client: Client, message: Message):
     uid = message.from_user.id
     text = message.text or ""
@@ -2623,18 +3023,15 @@ async def text_handler(client: Client, message: Message):
         admin_states.pop(uid, None)
         vid = text.strip()
         if not VOICE_RE.match(vid):
-            await message.reply_text("❌ That does not look like a voice id (e.g. en-US-AndrewNeural).")
+            await message.reply_text("❌ That does not look like a voice id (e.g. <code>en-US-AndrewNeural</code>).",
+                                     reply_markup=ikb([[("✏️ Try again", "voice_custom"), ("🔙 Settings", "back_settings")]]))
             return
         db.set_setting(uid, "voice", vid)
-        await message.reply_text(f"✅ Voice set to <code>{html.escape(vid)}</code>. Use /preview to test it.",
-                                 reply_markup=main_keyboard(uid))
+        await message.reply_text(f"✅ Voice set to <code>{html.escape(vid)}</code>.",
+                                 reply_markup=ikb([[("🔊 Preview", "preview"), ("⚙️ Settings", "back_settings")]]))
         return
     if is_admin(uid) and state and await _handle_admin_state(client, message, state, text):
         return
-    # reply-keyboard buttons have their own handlers (some registered after this one)
-    if text in ALL_BUTTONS:
-        admin_states.pop(uid, None)
-        message.continue_propagation()
     if not db.is_approved(uid):
         await deny(message)
         return
@@ -2642,19 +3039,19 @@ async def text_handler(client: Client, message: Message):
     if len(clean) < 5 or not is_speakable(clean):
         await message.reply_text("Send a longer text or a document to narrate.")
         return
-    if uid in active_jobs:
-        await message.reply_text("⏳ You already have a job running or queued. /cancel it first.")
+    cur = current_job(uid)
+    if cur:
+        await busy_reply(client, message.chat.id, cur)
         return
     token = uuid.uuid4().hex[:8]
     pending_text[uid] = (token, clean, time.time() + 600)
     s = db.settings(uid)
     await message.reply_text(
-        f"📝 {len(clean):,} characters · ≈ {fmt_duration(estimate_seconds(len(clean), s['rate']))} of audio\n"
+        f"📝 <b>{html.escape(_title_from_text(clean))}</b>\n"
+        f"{len(clean):,} characters · ≈ {fmt_duration(estimate_seconds(len(clean), s['rate']))} of audio\n"
         f"🗣 {html.escape(voice_label(s['voice']))}\n\nCreate the audiobook?",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🎧 Create Audio", callback_data=f"mk:{token}"),
-            InlineKeyboardButton("⚙️ Settings", callback_data="back_settings"),
-            InlineKeyboardButton("✖️", callback_data=f"mkno:{token}")]]))
+        reply_markup=ikb([[("🎧 Create Audio", f"mk:{token}")],
+                          [("⚙️ Settings", "back_settings"), ("✖️ Discard", f"mkno:{token}")]]))
 
 
 @bot.on_callback_query(filters.regex(r"^mk(no)?:"))
@@ -2683,9 +3080,8 @@ async def cb_text_confirm(client: Client, cq: CallbackQuery):
     txt_path = os.path.join(JOBS_DIR, f"src_{uid}_{uuid.uuid4().hex[:8]}.txt")
     with open(txt_path, "w", encoding="utf-8") as fh:
         fh.write(text)
-    with contextlib.suppress(Exception):
-        await cq.message.delete()
-    await start_job_from_file(client, cq.message.chat.id, uid, txt_path, _title_from_text(text), len(text))
+    await start_job_from_file(client, cq.message.chat.id, uid, txt_path, _title_from_text(text), len(text),
+                              status=cq.message)
 
 
 # =============================================================================
@@ -2707,10 +3103,12 @@ async def resume_job(client: Client, row: sqlite3.Row, status: Optional[Message]
     if job is None:
         return False
     chat_id = int(row["chat_id"] or uid)
+    text = (f"🔄 <b>Resuming</b> {html.escape((row['title'] or '')[:60])} (job #{row['id']})\n"
+            f"{stage_line('queued')}\n\nContinuing from chunk {row['cursor'] or 0}/{row['chunks'] or '?'}…")
     if status is None:
-        status = await safe_send(client, chat_id,
-                                 f"🔄 Resuming <b>{html.escape((row['title'] or '')[:60])}</b> "
-                                 f"(job #{row['id']}) after a restart...", reply_markup=cancel_markup(row["id"]))
+        status = await safe_send(client, chat_id, text, reply_markup=cancel_markup(row["id"]))
+    else:
+        await safe_edit(status, text, cancel_markup(row["id"]))
     job.task = asyncio.create_task(
         run_audiobook_job(client, status, uid, job, text_path, row["title"] or "Audiobook", base,
                           job_id=int(row["id"]), chat_id=chat_id))
@@ -2729,69 +3127,350 @@ async def resume_interrupted_jobs(client: Client) -> None:
             log.warning("resume of job %s failed: %s", row["id"], e)
 
 
-@bot.on_message(filters.command("resume") & filters.private)
-async def cmd_resume(client: Client, message: Message):
-    uid = message.from_user.id
+async def _do_resume(client: Client, uid: int, chat_id: int, status: Optional[Message]) -> None:
+    async def say(text: str, markup=None):
+        if status is not None:
+            await safe_edit(status, text, markup)
+        else:
+            await safe_send(client, chat_id, text, reply_markup=markup)
+
     if not db.is_approved(uid):
-        await deny(message)
+        await say("🔒 Not approved.")
         return
-    if uid in active_jobs:
-        await message.reply_text("⏳ You already have a job running or queued.")
+    cur = current_job(uid)
+    if cur:
+        await say(f"⏳ You already have a job:\n{job_summary_line(cur)}",
+                  ikb([[("⛔ Cancel it", f"canceljob:{cur.job_id}"), ("📊 Status", "status")]]))
         return
     rows = [r for r in db.unfinished_jobs() if r["user_id"] == uid]
     if not rows:
-        await message.reply_text("Nothing to resume.")
+        await say("Nothing to resume.", ikb([BACK_STATUS]))
         return
-    ok = await resume_job(client, rows[0])
-    if not ok:
-        await message.reply_text("❌ Could not resume - the source text is no longer available.")
+    if not await resume_job(client, rows[0], status=status):
+        await say("❌ Could not resume - the source text is no longer available.", ikb([BACK_STATUS]))
 
 
-@bot.on_message((filters.command("jobs") | filters.regex(f"^{re.escape(BTN_JOBS)}$")) & filters.private)
-async def cmd_jobs(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    lines = ["🧾 <b>Jobs</b>"]
-    for j in job_queue.running:
-        lines.append(f"▶️ #{j.job_id} user {j.user_id} · {html.escape(j.title[:30])} · {j.status_line}")
-    for n, j in enumerate(job_queue.waiting, 1):
-        lines.append(f"🕒 #{n} user {j.user_id} · {html.escape(j.title[:30])} · {j.chars:,} chars")
-    rows = db.q("SELECT * FROM jobs WHERE status IN ('paused','interrupted') ORDER BY id DESC LIMIT 10")
-    for r in rows:
-        lines.append(f"⏸ #{r['id']} user {r['user_id']} · {html.escape((r['title'] or '')[:30])} · "
-                     f"cursor {r['cursor']}/{r['chunks']} · {html.escape((r['last_error'] or '')[:60])}")
-    rows = db.q("SELECT * FROM jobs WHERE status IN ('done','failed','cancelled') ORDER BY id DESC LIMIT 5")
-    for r in rows:
-        lines.append(f"• #{r['id']} {r['status']} · {html.escape((r['title'] or '')[:30])} · {r['created'][:16]}")
-    await message.reply_text("\n".join(lines))
+@bot.on_message(filters.command("resume") & filters.private)
+async def cmd_resume(client: Client, message: Message):
+    await _do_resume(client, message.from_user.id, message.chat.id, None)
+
+
+@bot.on_callback_query(filters.regex(r"^resume$"))
+async def cb_resume(client: Client, cq: CallbackQuery):
+    await cq.answer()
+    await _do_resume(client, cq.from_user.id, cq.message.chat.id, cq.message)
 
 
 # =============================================================================
-# Admin panel
+# Admin panel - one inline message that edits itself (adm:<page>[:<arg>])
 # =============================================================================
-@bot.on_message((filters.command("admin") | filters.regex(f"^{re.escape(BTN_ADMIN)}$")) & filters.private)
-async def admin_panel(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    pend = db.q("SELECT COUNT(*) AS n FROM requests")[0]["n"]
-    await message.reply_text(
-        f"🛠 <b>Admin panel</b>\nWorkers: {len(db.servers())} · pending requests: {pend}\n"
-        f"TTS_API_KEY: {'set' if TTS_API_KEY else 'not set'}\n\n"
-        "Commands: /addserver &lt;url&gt; · /servers · /users · /stats · /jobs",
-        reply_markup=admin_keyboard())
+def _key_line() -> str:
+    return ("🔑 API key: <b>set</b>" if TTS_API_KEY
+            else "🔑 API key: not set <i>(optional - only if the Worker has an API_KEY secret)</i>")
 
 
-@bot.on_message(filters.regex(f"^{re.escape(BTN_BACK)}$") & filters.private)
-async def back_main(client: Client, message: Message):
-    admin_states.pop(message.from_user.id, None)
-    await message.reply_text("Main menu", reply_markup=main_keyboard(message.from_user.id))
+def admin_home() -> Tuple[str, InlineKeyboardMarkup]:
+    c = db.counts()
+    r_cnt, w_cnt = job_queue.counts()
+    txt = (f"🛠 <b>Admin panel</b> · bot v{VERSION}\n\n"
+           f"🖥 Workers: <b>{len(pool.usable())}/{len(pool.states())}</b> usable\n"
+           f"👥 Users: <b>{c['users']}</b> · approved {c['approved']} · banned {c['banned']}"
+           + (f" · <b>⏳ {c['pending']} pending</b>" if c['pending'] else "") + "\n"
+           f"🧾 Jobs: {r_cnt} running · {w_cnt} waiting\n"
+           f"{_key_line()}")
+    if not pool.states():
+        txt += "\n\n⚠️ <b>No Worker registered</b> - nothing can be voiced yet. Add one below."
+    rows = [[("🖥 Workers", "adm:workers"), ("👥 Users", "adm:users")],
+            [(f"🔑 Requests ({c['pending']})" if c['pending'] else "🔑 Requests", "adm:req"), ("🧾 Jobs", "adm:jobs")],
+            [("📈 Stats", "adm:stats"), ("📢 Broadcast", "adm:bcast")],
+            [("🔄 Refresh", "adm:home")] + CLOSE_ROW]
+    return txt, ikb(rows)
+
+
+def admin_workers(tested: bool = False) -> Tuple[str, InlineKeyboardMarkup]:
+    sts = pool.states()
+    lines = [f"🖥 <b>Workers</b> ({len(sts)})" + (" · just re-tested" if tested else "")]
+    if not sts:
+        lines.append("\nNone registered. Press ➕ Add and paste the Worker URL\n"
+                     "(<code>https://&lt;name&gt;.&lt;account&gt;.workers.dev</code>).")
+    for s in sts:
+        name = html.escape(short_server(s.url))
+        if s.benched:
+            lines.append(f"⛔ <b>{name}</b> · benched {fmt_duration(s.bench_left)} (throttle #{s.q_count})")
+        elif not s.ok:
+            lines.append(f"❌ <b>{name}</b> · {html.escape(s.error[:90] or 'unreachable')}")
+        else:
+            lines.append(f"✅ <b>{name}</b> · v{s.version or '?'} · {s.latency:.1f}s · "
+                         f"{s.limiter.active}/{s.limiter.limit} (max {s.limiter.ceiling}) · "
+                         f"done {s.chunks_done} · failed {s.chunks_failed}")
+    lines.append(f"\n{_key_line()}")
+    rows = [[("➕ Add", "adm:wadd"), ("🔄 Test all", "adm:wtest")]]
+    if sts:
+        rows.append([("🗑 Remove", "adm:wdel")])
+    rows.append([("🔙 Back", "adm:home")] + CLOSE_ROW)
+    return "\n".join(lines), ikb(rows)
 
 
 ADD_SERVER_PROMPT = (
-    "➕ <b>Add Worker</b>\nSend the Worker URL, e.g. <code>https://edge-tts-worker.your-account.workers.dev</code>\n"
-    "(one per line / comma separated for several).\n"
-    "I will run a real synthesis test before adding it.  /cancel to abort.\n\n"
+    "➕ <b>Add Worker</b>\n\nSend the Worker URL, e.g.\n<code>https://edge-tts-worker.your-account.workers.dev</code>\n"
+    "(several: one per line or comma separated).\n\n"
+    "I run <code>/health</code> and a real <code>/tts</code> synthesis before registering it.\n"
     "Tip: <code>/addserver &lt;url&gt;</code> works from anywhere.")
+
+
+def admin_users() -> Tuple[str, InlineKeyboardMarkup]:
+    c = db.counts()
+    txt = (f"👥 <b>Users</b>\n\nTotal <b>{c['users']}</b> · approved {c['approved']} · banned {c['banned']} · "
+           f"pending {c['pending']}")
+    rows = [[("📋 List", "adm:ulist:0"), (f"🔑 Requests ({c['pending']})", "adm:req")],
+            [("✅ Approve by ID", "adm:uapprove"), ("🚫 Revoke / Ban", "adm:urevoke")],
+            [("🔙 Back", "adm:home")] + CLOSE_ROW]
+    return txt, ikb(rows)
+
+
+USERS_PER_PAGE = 15
+
+
+def admin_user_list(page: int) -> Tuple[str, InlineKeyboardMarkup]:
+    total = db.counts()["users"]
+    pages = max(1, (total + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    rows_db = db.q("SELECT * FROM users ORDER BY joined DESC LIMIT ? OFFSET ?", (USERS_PER_PAGE, page * USERS_PER_PAGE))
+    lines = [f"📋 <b>Users</b> · page {page + 1}/{pages}"]
+    for r in rows_db:
+        st = "🚫" if r["banned"] else ("✅" if r["approved"] else "⏳")
+        lines.append(f"{st} <code>{r['user_id']}</code> {html.escape(r['first_name'] or '')} "
+                     f"@{r['username'] or '-'} · {r['total_jobs'] or 0} jobs"
+                     + (f" · until {r['expiry'][:10]}" if r["expiry"] else ""))
+    nav: List[Tuple[str, str]] = []
+    if page > 0:
+        nav.append(("◀️", f"adm:ulist:{page - 1}"))
+    if page < pages - 1:
+        nav.append(("▶️", f"adm:ulist:{page + 1}"))
+    rows = ([nav] if nav else []) + [[("🔙 Back", "adm:users")] + CLOSE_ROW]
+    return "\n".join(lines)[:4000], ikb(rows)
+
+
+def admin_requests() -> Tuple[str, InlineKeyboardMarkup]:
+    pend = db.q("SELECT r.user_id, r.requested, u.first_name, u.username FROM requests r "
+                "LEFT JOIN users u ON u.user_id=r.user_id ORDER BY r.requested")
+    if not pend:
+        return "🔑 <b>Access requests</b>\n\nNo pending requests.", ikb([[("🔙 Back", "adm:home")] + CLOSE_ROW])
+    lines = [f"🔑 <b>Access requests</b> ({len(pend)})\nPick a duration under each user:"]
+    rows: List[List[Tuple[str, str]]] = []
+    for r in pend[:5]:
+        who = f"{r['first_name'] or ''} @{r['username'] or '-'}".strip()
+        lines.append(f"• <code>{r['user_id']}</code> {html.escape(who)} · {(r['requested'] or '')[:16]}")
+        rows.append([(f"👤 {who[:22] or r['user_id']}", "noop")])
+        t = r["user_id"]
+        rows.append([("7d", f"adm:ok:{t}:7"), ("30d", f"adm:ok:{t}:30"), ("90d", f"adm:ok:{t}:90"),
+                     ("♾", f"adm:ok:{t}:0"), ("🚫", f"adm:ban:{t}")])
+    if len(pend) > 5:
+        lines.append(f"…and {len(pend) - 5} more.")
+    rows.append([("🔙 Back", "adm:home")] + CLOSE_ROW)
+    return "\n".join(lines), ikb(rows)
+
+
+def admin_jobs() -> Tuple[str, InlineKeyboardMarkup]:
+    lines = ["🧾 <b>Jobs</b>"]
+    rows: List[List[Tuple[str, str]]] = []
+    live = job_queue.running + job_queue.waiting
+    if not live:
+        lines.append("\nNothing running or queued.")
+    for j in job_queue.running:
+        lines.append(f"▶️ #{j.job_id} user <code>{j.user_id}</code> · {html.escape(j.title[:30])} · "
+                     f"{j.status_line or 'starting'} · {dict(JOB_STAGES).get(j.stage, j.stage)}")
+    for n, j in enumerate(job_queue.waiting, 1):
+        lines.append(f"🕒 #{n} user <code>{j.user_id}</code> · {html.escape(j.title[:30])} · {j.chars:,} chars")
+    kill = [(f"⛔ #{j.job_id or '?'}", f"adm:kill:{j.user_id}") for j in live[:6]]
+    if kill:
+        rows.append(kill[:3])
+        if kill[3:]:
+            rows.append(kill[3:])
+    paused = db.q("SELECT * FROM jobs WHERE status IN ('paused','interrupted') ORDER BY id DESC LIMIT 8")
+    if paused:
+        lines.append("")
+        for r in paused:
+            lines.append(f"⏸ #{r['id']} user <code>{r['user_id']}</code> · {html.escape((r['title'] or '')[:30])} · "
+                         f"{r['cursor'] or 0}/{r['chunks'] or '?'} · {html.escape((r['last_error'] or '')[:50])}")
+    recent = db.q("SELECT * FROM jobs WHERE status IN ('done','failed','cancelled') ORDER BY id DESC LIMIT 6")
+    if recent:
+        lines.append("")
+        for r in recent:
+            icon = {"done": "✅", "failed": "❌", "cancelled": "⛔"}.get(r["status"], "•")
+            lines.append(f"{icon} #{r['id']} {html.escape((r['title'] or '')[:30])} · {(r['created'] or '')[:16]}")
+    rows.append([("🔄 Refresh", "adm:jobs"), ("🔙 Back", "adm:home")] + CLOSE_ROW)
+    return "\n".join(lines)[:4000], ikb(rows)
+
+
+def admin_stats() -> Tuple[str, InlineKeyboardMarkup]:
+    users = db.q("SELECT COUNT(*) AS n, SUM(approved) AS a, SUM(banned) AS b FROM users")[0]
+    jobs = db.q("SELECT COUNT(*) AS n, SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS d, "
+                "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS f, "
+                "SUM(chars) AS c, SUM(duration) AS s FROM jobs")[0]
+    today = db.q("SELECT COUNT(*) AS n, SUM(duration) AS s FROM jobs WHERE status='done' AND finished >= ?",
+                 (datetime.now().strftime("%Y-%m-%d 00:00:00"),))[0]
+    r_cnt, w_cnt = job_queue.counts()
+    done_chunks = sum(s.chunks_done for s in pool.states())
+    failed_chunks = sum(s.chunks_failed for s in pool.states())
+    txt = (f"📈 <b>Stats</b>\n\n"
+           f"👥 Users {users['n']} · approved {users['a'] or 0} · banned {users['b'] or 0}\n"
+           f"🧾 Jobs {jobs['n']} · done {jobs['d'] or 0} · failed {jobs['f'] or 0}\n"
+           f"🎵 {fmt_duration(jobs['s'] or 0)} of audio from {(jobs['c'] or 0):,} chars\n"
+           f"📅 Today: {today['n'] or 0} done · {fmt_duration(today['s'] or 0)}\n"
+           f"⚙️ Now: {r_cnt} running · {w_cnt} waiting · chunks this session {done_chunks} ok / {failed_chunks} failed\n"
+           f"🖥 Workers {len(pool.usable())}/{len(pool.states())} usable · 💾 free disk {free_disk_mb(BASE_DIR):,.0f} MB · "
+           f"ffmpeg {'yes' if FFMPEG else 'no'}")
+    return txt, ikb([[("🔄 Refresh", "adm:stats"), ("🔙 Back", "adm:home")] + CLOSE_ROW])
+
+
+ADMIN_PAGES = {"home": admin_home, "workers": admin_workers, "users": admin_users, "req": admin_requests,
+               "jobs": admin_jobs, "stats": admin_stats}
+
+
+async def admin_open(client: Client, message: Message, page: str = "home") -> None:
+    """Send the admin panel as a new message (from a command / reply button)."""
+    if page in ("wadd", "uapprove", "urevoke", "bcast"):
+        msg = await message.reply_text("🛠 Admin panel", reply_markup=main_keyboard(message.from_user.id))
+        await admin_render(msg, page, "", message.from_user.id)
+        return
+    txt, markup = ADMIN_PAGES.get(page, admin_home)()
+    await message.reply_text(txt, reply_markup=markup)
+
+
+async def admin_render(msg: Message, page: str, arg: str, uid: int) -> None:
+    """Edit ``msg`` in place to show ``page``."""
+    prompts = {
+        "wadd": ("add_server", ADD_SERVER_PROMPT, "adm:workers"),
+        "uapprove": ("approve", "✅ <b>Approve by ID</b>\n\nSend <code>user_id</code> or <code>user_id days</code> "
+                                "(days 0 = lifetime).", "adm:users"),
+        "urevoke": ("revoke", "🚫 <b>Revoke / Ban</b>\n\nSend <code>user_id</code> to revoke, "
+                              "<code>user_id ban</code> to ban, <code>user_id unban</code> to lift a ban.", "adm:users"),
+        "bcast": ("broadcast", "📢 <b>Broadcast</b>\n\nSend the message to deliver to all approved users.", "adm:home"),
+    }
+    if page in prompts:
+        state, text, back = prompts[page]
+        admin_states[uid] = state
+        await safe_edit(msg, text, ikb([[("🔙 Cancel", back)]]))
+        return
+    admin_states.pop(uid, None)
+    if page == "ulist":
+        txt, markup = admin_user_list(int(arg or 0))
+    elif page == "wdel":
+        urls = db.servers(enabled_only=False)
+        rows = [[(f"🗑 {short_server(u)}", f"adm:wrm:{i}")] for i, u in enumerate(urls)]
+        rows.append([("🔙 Back", "adm:workers")])
+        txt, markup = ("🗑 <b>Remove Worker</b>\n\nTap the Worker to remove it (takes effect immediately):"
+                       if urls else "No Workers registered."), ikb(rows)
+    else:
+        txt, markup = ADMIN_PAGES.get(page, admin_home)()
+    await safe_edit(msg, txt, markup)
+
+
+@bot.on_message(filters.command("admin") & filters.private)
+async def cmd_admin(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await admin_open(client, message, "home")
+
+
+@bot.on_message(filters.command("servers") & filters.private)
+async def cmd_servers(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    if http_session is None:
+        await message.reply_text("Starting up, try again in a moment.")
+        return
+    msg = await message.reply_text("🔍 Testing Workers (health + real synthesis)…")
+    await pool.refresh(http_session, deep=True)
+    txt, markup = admin_workers(tested=True)
+    await safe_edit(msg, txt, markup)
+
+
+@bot.on_message(filters.command("users") & filters.private)
+async def cmd_users(client: Client, message: Message):
+    if is_admin(message.from_user.id):
+        await admin_open(client, message, "users")
+
+
+@bot.on_message(filters.command("stats") & filters.private)
+async def cmd_stats(client: Client, message: Message):
+    if is_admin(message.from_user.id):
+        await admin_open(client, message, "stats")
+
+
+@bot.on_message(filters.command("jobs") & filters.private)
+async def cmd_jobs(client: Client, message: Message):
+    if is_admin(message.from_user.id):
+        await admin_open(client, message, "jobs")
+
+
+@bot.on_message(filters.command(["addserver", "add_server"]) & filters.private)
+async def cmd_add_server(client: Client, message: Message):
+    """/addserver <url> [<url> ...] - register Worker(s) directly (owner only)."""
+    if not is_admin(message.from_user.id):
+        return
+    arg = (message.text or "").split(None, 1)
+    if len(arg) < 2 or not arg[1].strip():
+        await admin_open(client, message, "wadd")
+        return
+    admin_states.pop(message.from_user.id, None)
+    await add_servers(message, arg[1])
+
+
+@bot.on_callback_query(filters.regex(r"^adm:"))
+async def cb_admin(client: Client, cq: CallbackQuery):
+    uid = cq.from_user.id
+    if not is_admin(uid):
+        await cq.answer("Owner only", show_alert=True)
+        return
+    parts = cq.data.split(":")
+    page = parts[1] if len(parts) > 1 else "home"
+    arg = parts[2] if len(parts) > 2 else ""
+    if page == "wtest":
+        if http_session is None:
+            await cq.answer("Starting up…", show_alert=True)
+            return
+        await cq.answer("Testing every Worker (health + real synthesis)…")
+        await safe_edit(cq.message, "🔍 Testing Workers (health + real synthesis)…")
+        await pool.refresh(http_session, deep=True)
+        txt, markup = admin_workers(tested=True)
+        await safe_edit(cq.message, txt, markup)
+        return
+    if page == "wrm":
+        urls = db.servers(enabled_only=False)
+        idx = int(arg or -1)
+        if 0 <= idx < len(urls):
+            db.remove_server(urls[idx])
+            pool.sync_from_db()
+            await cq.answer(f"Removed {short_server(urls[idx])}")
+        else:
+            await cq.answer("Already gone")
+        await admin_render(cq.message, "workers", "", uid)
+        return
+    if page == "ok":
+        note = await grant_access(client, int(arg), int(parts[3]) if len(parts) > 3 else 0)
+        await cq.answer(re.sub(r"<[^>]+>", "", note))
+        await admin_render(cq.message, "req", "", uid)
+        return
+    if page == "ban":
+        note = await ban_user(client, int(arg))
+        await cq.answer(re.sub(r"<[^>]+>", "", note))
+        await admin_render(cq.message, "req", "", uid)
+        return
+    if page == "kill":
+        j = active_jobs.get(int(arg or 0))
+        if j:
+            j.cancel.set()
+            await job_queue.kick()
+            await cq.answer("Cancelling…")
+            await asyncio.sleep(1.0)
+        else:
+            await cq.answer("Job already finished")
+        await admin_render(cq.message, "jobs", "", uid)
+        return
+    await admin_render(cq.message, page, arg, uid)
+    await cq.answer()
 
 
 async def add_servers(message: Message, text: str) -> None:
@@ -2805,56 +3484,38 @@ async def add_servers(message: Message, text: str) -> None:
         if nu and nu not in urls:
             urls.append(nu)
     if not urls:
-        await message.reply_text("❌ No valid URL found. Example: <code>https://name.account.workers.dev</code>")
+        await message.reply_text("❌ No valid URL found. Example: <code>https://name.account.workers.dev</code>",
+                                 reply_markup=ikb([[("🔁 Try again", "adm:wadd"), ("🔙 Workers", "adm:workers")]]))
         return
-    status = await message.reply_text(f"🔍 Testing {len(urls)} Worker(s) (health + real synthesis)...")
-    out: List[str] = []
+    status = await message.reply_text(f"🔍 Testing {len(urls)} Worker(s)…\n1️⃣ /health · 2️⃣ real /tts synthesis")
+    out: List[str] = ["➕ <b>Add Worker</b>"]
     failed: List[str] = []
-    for u in urls:
+    for n, u in enumerate(urls, 1):
+        await safe_edit(status, f"🔍 Testing Worker {n}/{len(urls)}: <code>{html.escape(short_server(u))}</code>\n"
+                                "1️⃣ /health · 2️⃣ real /tts synthesis…")
         info = await check_server(http_session, u, deep=True)
         if info["ok"]:
             added = db.add_server(u)
-            out.append(f"✅ {html.escape(short_server(u))} v{info.get('version') or '?'}"
-                       f" · {info.get('latency')}s · max_conc {info.get('max_concurrency', '?')}"
+            out.append(f"✅ <b>{html.escape(short_server(u))}</b> · v{info.get('version') or '?'} · "
+                       f"{info.get('latency')}s · max_conc {info.get('max_concurrency', '?')}"
                        + ("" if added else " (already registered)"))
         else:
             failed.append(u)
-            out.append(f"❌ {html.escape(short_server(u))}: {html.escape(info['error'] or 'unknown error')}")
+            out.append(f"❌ <b>{html.escape(short_server(u))}</b>: {html.escape(info['error'] or 'unknown error')}")
     pool.sync_from_db()
-    markup = None
+    if pool.states() and http_session is not None:
+        with contextlib.suppress(Exception):
+            await pool.refresh(http_session)
+    rows: List[List[Tuple[str, str]]] = []
     if failed:
-        # let the admin force-register a Worker that is temporarily down / throttled
         token = uuid.uuid4().hex[:8]
         pending_servers[token] = (failed, time.time() + 900)
-        out.append("\nWorker failed the test. Check the URL / API key, or add it anyway (it will be retried "
-                   "automatically by the health loop).")
-        markup = InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add anyway", callback_data=f"addsrv:{token}"),
-                                        InlineKeyboardButton("✖️", callback_data="close")]])
-    n = len(db.servers())
-    out.append(f"\nRegistered Workers: <b>{n}</b>")
-    await safe_edit(status, "\n".join(out), reply_markup=markup)
-
-
-@bot.on_message(filters.regex(f"^{re.escape(BTN_ADD_SERVER)}$") & filters.private)
-async def btn_add_server(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    admin_states[message.from_user.id] = "add_server"
-    await message.reply_text(ADD_SERVER_PROMPT, reply_markup=admin_keyboard())
-
-
-@bot.on_message(filters.command(["addserver", "add_server"]) & filters.private)
-async def cmd_add_server(client: Client, message: Message):
-    """/addserver <url> [<url> ...] - register Worker(s) directly (owner only)."""
-    if not is_admin(message.from_user.id):
-        return
-    arg = (message.text or "").split(None, 1)
-    if len(arg) < 2 or not arg[1].strip():
-        admin_states[message.from_user.id] = "add_server"
-        await message.reply_text(ADD_SERVER_PROMPT, reply_markup=admin_keyboard())
-        return
-    admin_states.pop(message.from_user.id, None)
-    await add_servers(message, arg[1])
+        out.append("\nThe Worker failed the test - check the URL / API key, or add it anyway "
+                   "(the health loop re-tests it every few minutes).")
+        rows.append([("➕ Add anyway", f"addsrv:{token}"), ("🔁 Try again", "adm:wadd")])
+    out.append(f"\n🖥 Registered Workers: <b>{len(db.servers())}</b>")
+    rows.append([("🖥 Workers", "adm:workers"), ("🛠 Admin panel", "adm:home")])
+    await safe_edit(status, "\n".join(out), ikb(rows))
 
 
 @bot.on_callback_query(filters.regex(r"^addsrv:"))
@@ -2870,180 +3531,62 @@ async def cb_add_server_anyway(client: Client, cq: CallbackQuery):
     added = [u for u in entry[0] if db.add_server(u, note="added without passing the probe")]
     pool.sync_from_db()
     lines = [f"➕ Registered <code>{html.escape(u)}</code>" for u in added] or ["Already registered."]
-    lines.append(f"Registered Workers: <b>{len(db.servers())}</b> · use 🖥 Server Status to re-test.")
-    with contextlib.suppress(Exception):
-        await cq.message.edit_text("\n".join(lines))
+    lines.append(f"🖥 Registered Workers: <b>{len(db.servers())}</b> · use 🔄 Test all to re-test.")
+    await safe_edit(cq.message, "\n".join(lines), ikb([[("🖥 Workers", "adm:workers"), ("🛠 Admin panel", "adm:home")]]))
     await cq.answer("Added")
-
-
-@bot.on_message(filters.regex(f"^{re.escape(BTN_DEL_SERVER)}$") & filters.private)
-async def btn_remove_server(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    urls = db.servers(enabled_only=False)
-    if not urls:
-        await message.reply_text("No Workers registered.")
-        return
-    rows = [[InlineKeyboardButton(f"🗑 {short_server(u)}", callback_data=f"delsrv:{i}")] for i, u in enumerate(urls)]
-    await message.reply_text("Select the Worker to remove:", reply_markup=InlineKeyboardMarkup(rows))
-
-
-@bot.on_callback_query(filters.regex(r"^delsrv:\d+$"))
-async def cb_del_server(client: Client, cq: CallbackQuery):
-    if not is_admin(cq.from_user.id):
-        await cq.answer("Owner only", show_alert=True)
-        return
-    urls = db.servers(enabled_only=False)
-    idx = int(cq.data.split(":")[1])
-    if idx >= len(urls):
-        await cq.answer("Gone")
-        return
-    db.remove_server(urls[idx])
-    pool.sync_from_db()
-    await cq.message.edit_text(f"🗑 Removed <code>{html.escape(urls[idx])}</code>")
-    await cq.answer()
-
-
-@bot.on_message((filters.command("servers") | filters.regex(f"^{re.escape(BTN_SERVERS)}$")) & filters.private)
-async def btn_server_status(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    if http_session is None:
-        await message.reply_text("Starting up, try again in a moment.")
-        return
-    urls = db.servers(enabled_only=False)
-    if not urls:
-        await message.reply_text("No Workers registered. Use ➕ Add Server.")
-        return
-    status = await message.reply_text("🔍 Probing Workers (real synthesis test)...")
-    infos = await pool.refresh(http_session, deep=True)
-    lines = ["🖥 <b>TTS Workers</b>"]
-    for info in infos:
-        s = pool.servers.get(info["url"])
-        name = short_server(info["url"])
-        if info.get("ok"):
-            lines.append(f"✅ <b>{html.escape(name)}</b> · v{info.get('version') or '?'} · {info.get('latency')}s · "
-                         f"limit {s.limiter.limit}/{s.limiter.ceiling} · max_text {s.max_text_length} · "
-                         f"done {s.chunks_done} · failed {s.chunks_failed}"
-                         + (f" · ⛔ benched {fmt_duration(s.bench_left)} (#{s.q_count})" if s and s.benched else ""))
-        else:
-            lines.append(f"❌ <b>{html.escape(name)}</b> · {html.escape(info.get('error') or 'unknown error')}")
-    lines.append(f"\nTTS_API_KEY on bot: {'set' if TTS_API_KEY else 'not set'}")
-    await safe_edit(status, "\n".join(lines))
-
-
-@bot.on_message(filters.regex(f"^{re.escape(BTN_APPROVE)}$") & filters.private)
-async def btn_approve(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    pend = db.q("SELECT r.user_id, r.requested, u.first_name, u.username FROM requests r "
-                "LEFT JOIN users u ON u.user_id=r.user_id ORDER BY r.requested")
-    for r in pend[:20]:
-        await message.reply_text(
-            f"🔑 {html.escape(r['first_name'] or '')} (@{r['username'] or '-'}) · <code>{r['user_id']}</code>"
-            f" · requested {r['requested']}", reply_markup=approval_markup(r["user_id"]))
-    admin_states[message.from_user.id] = "approve"
-    await message.reply_text(
-        f"{len(pend)} pending request(s) above.\nOr send <code>user_id [days]</code> to approve manually "
-        "(days 0 = lifetime). /cancel to abort.")
-
-
-@bot.on_message(filters.regex(f"^{re.escape(BTN_REVOKE)}$") & filters.private)
-async def btn_revoke(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    admin_states[message.from_user.id] = "revoke"
-    await message.reply_text("🚫 Send <code>user_id</code> to revoke access, or <code>user_id ban</code> to ban. "
-                             "<code>user_id unban</code> lifts a ban. /cancel to abort.")
-
-
-@bot.on_message((filters.command("users") | filters.regex(f"^{re.escape(BTN_USERS)}$")) & filters.private)
-async def btn_users(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    rows = db.q("SELECT * FROM users ORDER BY joined DESC LIMIT 60")
-    lines = [f"👥 <b>Users</b> ({db.q('SELECT COUNT(*) AS n FROM users')[0]['n']})"]
-    for r in rows:
-        if r["banned"]:
-            st = "🚫"
-        elif r["approved"]:
-            st = "✅"
-        else:
-            st = "⏳"
-        lines.append(f"{st} <code>{r['user_id']}</code> {html.escape(r['first_name'] or '')} "
-                     f"@{r['username'] or '-'} · {r['total_jobs']} jobs"
-                     + (f" · until {r['expiry'][:10]}" if r["expiry"] else ""))
-    await message.reply_text("\n".join(lines)[:4000])
-
-
-@bot.on_message(filters.regex(f"^{re.escape(BTN_BROADCAST)}$") & filters.private)
-async def btn_broadcast(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    admin_states[message.from_user.id] = "broadcast"
-    await message.reply_text("📢 Send the message to broadcast to all approved users. /cancel to abort.")
-
-
-@bot.on_message((filters.command("stats") | filters.regex(f"^{re.escape(BTN_STATS)}$")) & filters.private)
-async def btn_stats(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    users = db.q("SELECT COUNT(*) AS n, SUM(approved) AS a, SUM(banned) AS b FROM users")[0]
-    jobs = db.q("SELECT COUNT(*) AS n, SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS d, "
-                "SUM(chars) AS c, SUM(duration) AS s FROM jobs")[0]
-    r_cnt, w_cnt = job_queue.counts()
-    await message.reply_text(
-        f"📈 <b>Stats</b>\nUsers {users['n']} · approved {users['a'] or 0} · banned {users['b'] or 0}\n"
-        f"Jobs {jobs['n']} · done {jobs['d'] or 0} · {(jobs['c'] or 0):,} chars · {fmt_duration(jobs['s'] or 0)} audio\n"
-        f"Now: running {r_cnt} · waiting {w_cnt}\n"
-        f"Workers: {len(pool.usable())}/{len(pool.states())} usable · free disk {free_disk_mb(BASE_DIR):,.0f} MB")
 
 
 async def _handle_admin_state(client: Client, message: Message, state: str, text: str) -> bool:
     uid = message.from_user.id
+    back = ikb([[("🛠 Admin panel", "adm:home")]])
     if state == "add_server":
-        if text in ALL_BUTTONS:
-            return False  # admin pressed another button - let its handler run
         admin_states.pop(uid, None)
         await add_servers(message, text)
         return True
     if state == "approve":
         m = re.match(r"^\s*(\d{5,})\s*(\d+)?\s*$", text)
         if not m:
-            return False
+            await message.reply_text("Send <code>user_id</code> or <code>user_id days</code> (or press Cancel).")
+            return True
         admin_states.pop(uid, None)
         msg = await grant_access(client, int(m.group(1)), int(m.group(2) or 0))
-        await message.reply_text(msg, reply_markup=admin_keyboard())
+        await message.reply_text(msg, reply_markup=back)
         return True
     if state == "revoke":
         m = re.match(r"^\s*(\d{5,})\s*(ban|unban)?\s*$", text, re.I)
         if not m:
-            return False
+            await message.reply_text("Send <code>user_id</code>, <code>user_id ban</code> or <code>user_id unban</code>.")
+            return True
         admin_states.pop(uid, None)
         target = int(m.group(1))
         mode = (m.group(2) or "").lower()
         db.ensure_user(target, None, None)
         if mode == "unban":
             db.x("UPDATE users SET banned=0 WHERE user_id=?", (target,))
-            await message.reply_text(f"✅ User {target} unbanned (not approved yet).", reply_markup=admin_keyboard())
+            await message.reply_text(f"✅ User <code>{target}</code> unbanned (not approved yet).", reply_markup=back)
         else:
             db.revoke(target, ban=(mode == "ban"))
             j = active_jobs.get(target)
             if j:
                 j.cancel.set()
             await safe_send(client, target, "🚫 Your access has been revoked.")
-            await message.reply_text(f"🚫 User {target} {'banned' if mode == 'ban' else 'revoked'}.",
-                                     reply_markup=admin_keyboard())
+            await message.reply_text(f"🚫 User <code>{target}</code> {'banned' if mode == 'ban' else 'revoked'}.",
+                                     reply_markup=back)
         return True
     if state == "broadcast":
         admin_states.pop(uid, None)
         rows = db.q("SELECT user_id FROM users WHERE approved=1 AND banned=0")
+        status = await message.reply_text(f"📢 Sending to {len(rows)} users… 0%")
         sent = 0
-        for r in rows:
+        last = 0.0
+        for n, r in enumerate(rows, 1):
             if await safe_send(client, int(r["user_id"]), f"📢 {text}"):
                 sent += 1
+            if time.time() - last > 2:
+                last = time.time()
+                await safe_edit(status, f"📢 Sending… {progress_bar(int(100 * n / len(rows)))} {n}/{len(rows)}")
             await asyncio.sleep(0.05)
-        await message.reply_text(f"📢 Sent to {sent}/{len(rows)} users.", reply_markup=admin_keyboard())
+        await safe_edit(status, f"📢 Broadcast delivered to <b>{sent}/{len(rows)}</b> users.", back)
         return True
     return False
 
@@ -3073,6 +3616,24 @@ def _check_config() -> None:
         sys.exit(2)
 
 
+async def register_commands() -> None:
+    """Populate Telegram's '/' menu so users do not need a wall of keyboard buttons."""
+    from pyrogram.types import BotCommand, BotCommandScopeChat
+    user_cmds = [BotCommand("start", "Main menu"), BotCommand("settings", "Voice, rate, pitch, split"),
+                 BotCommand("preview", "Hear the selected voice"), BotCommand("status", "My job, account, history"),
+                 BotCommand("cancel", "Stop my current job"), BotCommand("resume", "Continue an interrupted job"),
+                 BotCommand("queue", "Job queue"), BotCommand("help", "How to use")]
+    with contextlib.suppress(Exception):
+        await bot.set_bot_commands(user_cmds)
+    if OWNER_ID:
+        with contextlib.suppress(Exception):
+            await bot.set_bot_commands(user_cmds + [BotCommand("admin", "Admin panel"),
+                                                   BotCommand("servers", "Test all Workers"),
+                                                   BotCommand("addserver", "Add a Worker URL"),
+                                                   BotCommand("jobs", "All jobs"), BotCommand("stats", "Statistics")],
+                                       scope=BotCommandScopeChat(chat_id=OWNER_ID))
+
+
 async def main() -> None:
     global http_session
     _check_config()
@@ -3091,18 +3652,23 @@ async def main() -> None:
         raise RuntimeError("event loop mismatch: bot.py must be run with LOOP.run_until_complete(main())")
     await bot.start()
     me = await bot.get_me()
-    log.info("logged in as @%s", me.username)
+    log.info("logged in as @%s (TTS_API_KEY %s)", me.username, "set" if TTS_API_KEY else "not set - optional")
+    await register_commands()
     if pool.states():
         with contextlib.suppress(Exception):
             await pool.refresh(http_session)
             log.info("Workers: %s", pool.summary())
     else:
-        log.warning("No TTS Worker registered yet - add one with /admin -> Add Server or TTS_SERVERS")
+        log.warning("No TTS Worker registered yet - add one with /admin -> Workers -> Add (or TTS_SERVERS)")
     ka = asyncio.create_task(keep_alive_loop())
     if RESUME_ON_START:
         await resume_interrupted_jobs(bot)
     if OWNER_ID:
-        await safe_send(bot, OWNER_ID, f"🤖 Bot v{VERSION} started · Workers: {html.escape(pool.summary())}")
+        n_ok, n_all = len(pool.usable()), len(pool.states())
+        txt = (f"🤖 <b>Bot v{VERSION} started</b>\n🖥 Workers: {n_ok}/{n_all} usable\n{_key_line()}")
+        if not n_all:
+            txt += "\n\n⚠️ No Worker registered - open 🛠 Admin → Workers → ➕ Add."
+        await safe_send(bot, OWNER_ID, txt, reply_markup=main_keyboard(OWNER_ID))
     stop = asyncio.Event()
     try:
         import signal
