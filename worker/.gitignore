@@ -1,3 +1,7 @@
 node_modules/
 .wrangler/
 .dev.vars
+accounts.txt
+fleet-urls.txt
+fleet-failed.txt
+*.tmp

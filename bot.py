@@ -81,9 +81,12 @@
                      you can also add them from the Admin Panel)
    TTS_API_KEY       sent as X-API-Key - must equal the Worker's API_KEY secret
    CONTACT_USERNAME  shown to users who need access
-   REMOTE_CHUNK_SIZE=3000  PER_SERVER_CONCURRENCY=4  PER_SERVER_MAX_CONCURRENCY=8
-   MAX_TOTAL_CONCURRENCY=64  MAX_PARALLEL_JOBS=1  MAX_QUEUED_JOBS=20
-   QUARANTINE_STEPS=60,120,300,600  QUARANTINE_FORGIVE_AFTER=25
+   -- fleet tuning (defaults assume MANY Workers; Microsoft limits per egress) --
+   REMOTE_CHUNK_SIZE=2000  PER_SERVER_CONCURRENCY=2  PER_SERVER_MAX_CONCURRENCY=3
+   REMOTE_MIN_GAP_MS=250  MAX_TOTAL_CONCURRENCY=160  HEALTH_PARALLELISM=24
+   MAX_PARALLEL_JOBS=1  MAX_QUEUED_JOBS=20
+   QUARANTINE_STEPS=30,60,120,240  QUARANTINE_FORGIVE_AFTER=8  QUARANTINE_DECAY_SECS=300
+   SOFT_FAIL_LIMIT=4  SOFT_FAIL_WINDOW=120
    MAX_FILE_MB=200  JOBS_DIR=jobs  DB_PATH=bot_database.db  RESUME_ON_START=true
    LOG_LEVEL=INFO  PROGRESS_EDIT_INTERVAL=4
 =============================================================================
@@ -114,7 +117,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
-VERSION = "5.1.0"
+VERSION = "5.2.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -221,20 +224,31 @@ TTS_API_KEY = _env("TTS_API_KEY", "") or _env("API_KEY", "")
 TTS_SERVERS_ENV = [s.strip() for s in re.split(r"[,\s]+", _env("TTS_SERVERS", "")) if s.strip()]
 
 # Characters per HTTP request to a Worker (further clamped to the server's
-# advertised max_text_length).  The Worker splits it into websocket pieces and
-# synthesises them in parallel, so big chunks = fewer round trips.
-REMOTE_CHUNK_SIZE = max(500, min(_env_int("REMOTE_CHUNK_SIZE", 3000), 6000))
+# advertised max_text_length).  The Worker splits it into ~3.8 KB websocket
+# pieces; Devanagari is 3 bytes/char so 2000 chars = ~2 pieces = 2 sockets.
+#
+# Fleet model (100+ Workers): every Worker gets a LOW, steady load - Microsoft
+# rate-limits per egress, so "many Workers x 2 requests" is both faster and
+# far safer than "few Workers x 8 requests".  Total throughput comes from the
+# fleet size (MAX_TOTAL_CONCURRENCY), not from squeezing one Worker.
+REMOTE_CHUNK_SIZE = max(500, min(_env_int("REMOTE_CHUNK_SIZE", 2000), 6000))
 TARGET_CHUNK_CHARS = max(0, min(_env_int("TARGET_CHUNK_CHARS", 0), 6000))
 CHUNK_MIN_RATIO = max(0.3, min(_env_int("CHUNK_MIN_PERCENT", 60), 95) / 100.0)
-PER_SERVER_CONCURRENCY = max(1, min(_env_int("PER_SERVER_CONCURRENCY", 4), 16))
-PER_SERVER_MAX_CONCURRENCY = max(PER_SERVER_CONCURRENCY, min(_env_int("PER_SERVER_MAX_CONCURRENCY", 8), 16))
-REMOTE_MIN_GAP = max(0, _env_int("REMOTE_MIN_GAP_MS", 30)) / 1000.0
-REMOTE_GROW_AFTER = max(1, min(_env_int("REMOTE_GROW_AFTER", 3), 50))
-MAX_TOTAL_CONCURRENCY = max(4, min(_env_int("MAX_TOTAL_CONCURRENCY", 64), 256))
+PER_SERVER_CONCURRENCY = max(1, min(_env_int("PER_SERVER_CONCURRENCY", 2), 16))
+PER_SERVER_MAX_CONCURRENCY = max(PER_SERVER_CONCURRENCY, min(_env_int("PER_SERVER_MAX_CONCURRENCY", 3), 16))
+REMOTE_MIN_GAP = max(0, _env_int("REMOTE_MIN_GAP_MS", 250)) / 1000.0
+REMOTE_GROW_AFTER = max(1, min(_env_int("REMOTE_GROW_AFTER", 6), 50))
+MAX_TOTAL_CONCURRENCY = max(4, min(_env_int("MAX_TOTAL_CONCURRENCY", 160), 512))
+# Soft failures (timeouts, resets, empty audio) never bench a Worker on their
+# own; only this many within SOFT_FAIL_WINDOW seconds do.
+SOFT_FAIL_LIMIT = max(2, _env_int("SOFT_FAIL_LIMIT", 4))
+SOFT_FAIL_WINDOW = max(30, _env_int("SOFT_FAIL_WINDOW", 120))
+# /health probes of the fleet run at most this many at once (100+ Workers).
+HEALTH_PARALLELISM = max(4, min(_env_int("HEALTH_PARALLELISM", 24), 128))
 MAX_PARALLEL_JOBS = max(1, _env_int("MAX_PARALLEL_JOBS", 1))
 MAX_QUEUED_JOBS = max(MAX_PARALLEL_JOBS, _env_int("MAX_QUEUED_JOBS", 20))
 CHUNK_TIMEOUT = max(60, _env_int("CHUNK_TIMEOUT", 150))  # Worker SYNTH_TIMEOUT is 110 s
-PIPELINE_WINDOW_EXTRA = max(2, min(_env_int("PIPELINE_WINDOW_EXTRA", 8), 64))
+PIPELINE_WINDOW_EXTRA = max(2, min(_env_int("PIPELINE_WINDOW_EXTRA", 16), 256))
 PROGRESS_EDIT_INTERVAL = max(2.0, float(_env_int("PROGRESS_EDIT_INTERVAL", 4)))
 KEEP_ALIVE_INTERVAL = max(60, _env_int("KEEP_ALIVE_INTERVAL", 600))
 MIN_FREE_DISK_MB = max(0, _env_int("MIN_FREE_DISK_MB", 400))
@@ -249,9 +263,13 @@ MAX_ARCHIVE_BYTES = 800 * 1024 * 1024
 MAX_AUDIO_BYTES = 1900 * 1024 * 1024  # below Telegram's 2 GB limit
 JOB_MAX_STALL_MINUTES = max(0, _env_int("JOB_MAX_STALL_MINUTES", 0))
 STALL_BACKOFF_STEPS = [5, 10, 20, 30, 60, 90, 120, 180, 300]
-_q_steps = [max(15, int(x)) for x in re.findall(r"\d+", _env("QUARANTINE_STEPS", "60,120,300,600"))]
-QUARANTINE_STEPS: List[int] = _q_steps or [60, 120, 300, 600]
-QUARANTINE_FORGIVE_AFTER = max(5, _env_int("QUARANTINE_FORGIVE_AFTER", 25))
+# Bench ladder for a Worker Microsoft really throttled (403/429).  With a big
+# fleet a short bench is enough - the work simply flows to the other Workers -
+# and the level decays with clean chunks AND with time (QUARANTINE_DECAY_SECS).
+_q_steps = [max(10, int(x)) for x in re.findall(r"\d+", _env("QUARANTINE_STEPS", "30,60,120,240"))]
+QUARANTINE_STEPS: List[int] = _q_steps or [30, 60, 120, 240]
+QUARANTINE_FORGIVE_AFTER = max(3, _env_int("QUARANTINE_FORGIVE_AFTER", 8))
+QUARANTINE_DECAY_SECS = max(60, _env_int("QUARANTINE_DECAY_SECS", 300))
 RESUME_ON_START = _env_bool("RESUME_ON_START", True)
 PLAN_SLICE_CHARS = 200_000
 SUPPORTED_EXT = {".txt", ".md", ".docx", ".html", ".htm", ".epub", ".pdf"}
@@ -1079,7 +1097,15 @@ def read_plan(plan_path: str) -> List[Tuple[str, str]]:
 # Cloudflare Worker pool: health, adaptive limiter, quarantine, scheduling
 # =============================================================================
 class ThrottleError(RuntimeError):
-    """The Worker reported that Microsoft is throttling it (503/403/NoAudioReceived)."""
+    """The Worker reported that Microsoft is really rate-limiting it (403/429 -> 503 kind=throttle)."""
+
+    def __init__(self, msg: str, retry_after: int = 0):
+        super().__init__(msg)
+        self.retry_after = max(0, int(retry_after or 0))
+
+
+class TransientError(RuntimeError):
+    """Upstream hiccup (timeout, reset, empty audio) - retry on another Worker, do not bench this one."""
 
 
 class BusyError(RuntimeError):
@@ -1101,14 +1127,24 @@ def _headers() -> Dict[str, str]:
     return h
 
 
+def _retry_after(resp: aiohttp.ClientResponse) -> int:
+    try:
+        return max(0, int(float(resp.headers.get("Retry-After") or 0)))
+    except ValueError:
+        return 0
+
+
 async def _describe_http_error(resp: aiohttp.ClientResponse) -> Tuple[str, str]:
     """(kind, message) for a non-200 Worker reply. kind in throttle/busy/voice/fatal/retry."""
     detail = ""
+    declared = (resp.headers.get("X-Error-Kind") or "").strip().lower()
     try:
         body = await resp.text()
         try:
             j = json.loads(body)
-            detail = str(j.get("error") or j.get("message") or "") if isinstance(j, dict) else ""
+            if isinstance(j, dict):
+                detail = str(j.get("error") or j.get("message") or "")
+                declared = declared or str(j.get("kind") or "").strip().lower()
         except ValueError:
             detail = body.strip()
     except Exception:  # noqa: BLE001
@@ -1116,6 +1152,11 @@ async def _describe_http_error(resp: aiohttp.ClientResponse) -> Tuple[str, str]:
     detail = re.sub(r"\s+", " ", detail)[:160]
     low = detail.lower()
     st = resp.status
+    # Worker >= 5.2 tells us exactly what happened - no guessing needed.
+    if declared == "throttle" and st in (429, 502, 503):
+        return "throttle", f"HTTP {st}: Microsoft is rate-limiting this Worker{(' - ' + detail) if detail else ''}"
+    if declared == "transient" and st in (502, 503, 504):
+        return "retry", f"HTTP {st}: upstream hiccup{(' - ' + detail) if detail else ''}"
     if st == 401:
         hint = ("API key rejected - TTS_API_KEY on the bot must equal the Worker's API_KEY secret"
                 if TTS_API_KEY else "Worker requires an API key - set TTS_API_KEY on the bot")
@@ -1131,8 +1172,9 @@ async def _describe_http_error(resp: aiohttp.ClientResponse) -> Tuple[str, str]:
     if st in (502, 503, 504):
         if "slots in use" in low or low.startswith("server busy"):
             return "busy", f"HTTP {st}: server busy - trying another server"
-        if ("noaudio" in low.replace(" ", "") or "no audio" in low or "403" in low or "throttl" in low
-                or "too many" in low or "handshake" in low or st == 503):
+        # Older Workers (< 5.2): only an explicit rate-limit signal is throttling.
+        # Timeouts, resets and "no audio" are transient and must NOT bench the Worker.
+        if re.search(r"\b(403|429)\b", low) or "throttl" in low or "too many" in low or "rate limit" in low:
             return "throttle", f"HTTP {st}: Microsoft is throttling this Worker{(' - ' + detail) if detail else ''}"
         return "retry", f"HTTP {st}: upstream error{(' - ' + detail) if detail else ''}"
     return "retry", f"HTTP {st}{(': ' + detail) if detail else ''}"
@@ -1291,6 +1333,11 @@ class ServerState:
         self.clean_since_q = 0
         self.chunks_done = 0
         self.chunks_failed = 0
+        # transient failures (timeouts / resets / empty audio) in a sliding window
+        self.soft_fails: List[float] = []
+        # round-robin bookkeeping: when many Workers are equally free we rotate
+        # through them so the load (and Microsoft's attention) is spread thin
+        self.last_used = 0.0
 
     @property
     def benched(self) -> bool:
@@ -1300,26 +1347,52 @@ class ServerState:
     def bench_left(self) -> float:
         return max(0.0, self.q_until - time.monotonic())
 
-    def quarantine(self, reason: str) -> float:
+    def _decay(self) -> None:
+        """Quarantine level fades with time: every QUARANTINE_DECAY_SECS without a new incident = one level."""
+        if self.q_level and self.q_set_at:
+            idle = time.monotonic() - self.q_set_at
+            drop = int(idle // QUARANTINE_DECAY_SECS)
+            if drop > 0:
+                self.q_level = max(0, self.q_level - drop)
+                self.q_set_at += drop * QUARANTINE_DECAY_SECS
+
+    def quarantine(self, reason: str, hint: int = 0) -> float:
         now = time.monotonic()
         if self.benched and now - self.q_set_at < 10:
             # Requests that were already in flight when the server got benched all
             # fail together - that is one incident, not several escalations.
             return self.bench_left
+        self._decay()
         secs = QUARANTINE_STEPS[min(self.q_level, len(QUARANTINE_STEPS) - 1)]
+        if hint:
+            # the Worker's Retry-After knows best, but never longer than our ladder step
+            secs = max(10, min(secs, hint))
         self.q_until = now + secs
         self.q_set_at = now
         self.q_level = min(self.q_level + 1, len(QUARANTINE_STEPS))
         self.q_count += 1
         self.q_reason = reason[:120]
         self.clean_since_q = 0
+        self.soft_fails.clear()
         self.limiter.limit = 1
         self.limiter.clean = 0
         return secs
 
+    def soft_fail(self, reason: str) -> Optional[float]:
+        """A transient failure. Returns the bench length only if the Worker keeps failing."""
+        now = time.monotonic()
+        self.chunks_failed += 1
+        self.soft_fails = [t for t in self.soft_fails if now - t < SOFT_FAIL_WINDOW]
+        self.soft_fails.append(now)
+        if len(self.soft_fails) >= SOFT_FAIL_LIMIT:
+            return self.quarantine(f"{len(self.soft_fails)} failures in {SOFT_FAIL_WINDOW}s: {reason}")
+        return None
+
     def record_success(self) -> None:
         self.chunks_done += 1
         self.clean_since_q += 1
+        if self.soft_fails:
+            self.soft_fails.pop(0)
         if self.q_level and self.clean_since_q >= QUARANTINE_FORGIVE_AFTER:
             self.q_level -= 1
             self.clean_since_q = 0
@@ -1342,6 +1415,20 @@ class ServerState:
         if not self.ok:
             return f"❌ {name} {self.error[:50]}"
         return f"✅ {name} {self.limiter.active}/{self.limiter.limit}"
+
+
+async def _gather_limited(coros: List[Any], limit: int) -> List[Any]:
+    """asyncio.gather(return_exceptions=True) with at most ``limit`` coroutines running."""
+    sem = asyncio.Semaphore(max(1, limit))
+
+    async def run(c):
+        async with sem:
+            try:
+                return await c
+            except Exception as e:  # noqa: BLE001
+                return e
+
+    return list(await asyncio.gather(*(run(c) for c in coros)))
 
 
 class ServerPool:
@@ -1373,11 +1460,17 @@ class ServerPool:
         return max(500, min(REMOTE_CHUNK_SIZE, min(s.max_text_length for s in sts)))
 
     def pick(self, exclude: set) -> Optional[ServerState]:
-        cands = [s for s in self.usable() if s.url not in exclude]
+        """Least-loaded Worker; ties broken by *least recently used* so a big fleet
+        is rotated evenly instead of the same few fast Workers being hammered."""
+        cands = [s for s in self.usable() if s.url not in exclude and s.limiter.free > 0]
         if not cands:
-            return None
-        cands.sort(key=lambda s: (-s.limiter.free, s.latency, random.random()))
-        return cands[0]
+            cands = [s for s in self.usable() if s.url not in exclude]
+            if not cands:
+                return None
+        cands.sort(key=lambda s: (s.limiter.active, s.last_used, s.latency))
+        best = cands[0]
+        best.last_used = time.monotonic()
+        return best
 
     def any_free(self, exclude: set) -> bool:
         return any(s.limiter.free > 0 for s in self.usable() if s.url not in exclude)
@@ -1386,13 +1479,16 @@ class ServerPool:
         benched = [s.bench_left for s in self.servers.values() if s.benched]
         return min(benched) if benched else 0.0
 
-    async def refresh(self, session: aiohttp.ClientSession, deep: bool = False) -> List[Dict[str, Any]]:
+    def capacity(self) -> int:
+        return sum(s.limiter.limit for s in self.usable())
+
+    async def refresh(self, session: aiohttp.ClientSession, deep: bool = False,
+                      only: Optional[List[ServerState]] = None) -> List[Dict[str, Any]]:
         self.sync_from_db()
-        sts = self.states()
+        sts = only if only is not None else self.states()
         if not sts:
             return []
-        results = await asyncio.gather(*(check_server(session, s.url, deep=deep) for s in sts),
-                                       return_exceptions=True)
+        results = await _gather_limited([check_server(session, s.url, deep=deep) for s in sts], HEALTH_PARALLELISM)
         out: List[Dict[str, Any]] = []
         for s, info in zip(sts, results):
             if isinstance(info, Exception):
@@ -1403,11 +1499,27 @@ class ServerPool:
             out.append(info)
         return out
 
-    def summary(self) -> str:
+    def counts(self) -> Dict[str, int]:
+        sts = self.states()
+        benched = sum(1 for s in sts if s.benched)
+        down = sum(1 for s in sts if not s.ok and not s.benched)
+        return {"total": len(sts), "ok": len(sts) - benched - down, "benched": benched, "down": down,
+                "active": sum(s.limiter.active for s in sts), "capacity": self.capacity()}
+
+    def summary(self, max_names: int = 3) -> str:
+        """One line that stays short even with 100+ Workers."""
         sts = self.states()
         if not sts:
             return "no servers"
-        return " · ".join(s.describe() for s in sts)
+        if len(sts) <= max_names:
+            return " · ".join(s.describe() for s in sts)
+        c = self.counts()
+        txt = f"✅ {c['ok']}/{c['total']} Workers · {c['active']}/{c['capacity']} in flight"
+        if c["benched"]:
+            txt += f" · ⛔ {c['benched']} benched"
+        if c["down"]:
+            txt += f" · ❌ {c['down']} down"
+        return txt
 
 
 _network_slots = asyncio.Semaphore(MAX_TOTAL_CONCURRENCY)
@@ -1423,17 +1535,18 @@ async def _tts_request(session: aiohttp.ClientSession, srv: ServerState, text: s
         if r.status != 200:
             kind, msg = await _describe_http_error(r)
             if kind == "throttle":
-                raise ThrottleError(msg)
+                raise ThrottleError(msg, _retry_after(r))
             if kind == "busy":
                 raise BusyError(msg)
             if kind == "voice":
                 raise VoiceError(msg)
             if kind == "fatal":
                 raise FatalServerError(msg)
-            raise RuntimeError(msg)
+            raise TransientError(msg)
         data = await r.read()
         if len(data) < 200:
-            raise ThrottleError("Worker returned an empty audio stream (Microsoft throttling)")
+            # not a rate limit - just a bad reply; another Worker will do it
+            raise TransientError("Worker returned an empty audio stream")
         try:
             dur = int(r.headers.get("X-Duration-Ms") or 0)
         except ValueError:
@@ -1453,8 +1566,16 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
     """
     tried: set = set()
     last_err = "no servers available"
-    attempts = max(2, len(pool.servers) + 1)
+    # With a big fleet one chunk should hop across a handful of Workers, not all
+    # 100 of them - the pipeline re-queues it after a short pause anyway.
+    attempts = max(2, min(len(pool.servers) + 1, 6))
     second_pass = False
+
+    def soft(srv: ServerState, reason: str) -> None:
+        secs = srv.soft_fail(reason)
+        if secs:
+            log.warning("chunk %d: %s -> keeps failing, benched %ds", index + 1, reason, secs)
+
     for attempt in range(attempts):
         if cancel.is_set():
             raise JobCancelled()
@@ -1468,51 +1589,60 @@ async def fetch_chunk(session: aiohttp.ClientSession, pool: ServerPool, chunk: s
         text = chunk
         if len(text) > srv.max_text_length:
             text = text[: srv.max_text_length]  # planner already respects limits; safety only
-        async with _network_slots:
-            await srv.limiter.acquire()
-            try:
-                data, dur = await _tts_request(session, srv, text, settings)
-                await srv.limiter.success()
-                srv.record_success()
-                return data, dur, srv.url
-            except BusyError as e:
-                last_err = f"{short_server(srv.url)} -> {e}"
-                await srv.limiter.busy()
-                tried.add(srv.url)
-                await cancellable_sleep(1.0, cancel)
-            except ThrottleError as e:
-                last_err = f"{short_server(srv.url)} -> {e}"
-                await srv.limiter.throttled()
-                secs = srv.quarantine(str(e))
-                srv.chunks_failed += 1
-                log.warning("chunk %d: %s -> benched %ds", index + 1, last_err, secs)
-                tried.add(srv.url)
-            except VoiceError:
-                raise
-            except FatalServerError as e:
-                last_err = f"{short_server(srv.url)} -> {e}"
-                srv.ok = False
-                srv.error = str(e)
-                srv.chunks_failed += 1
-                log.error("chunk %d: %s (server disabled for this session)", index + 1, last_err)
-                tried.add(srv.url)
-            except asyncio.TimeoutError:
-                last_err = f"{short_server(srv.url)} -> timed out after {CHUNK_TIMEOUT}s"
-                srv.chunks_failed += 1
-                await srv.limiter.busy()
-                tried.add(srv.url)
-            except (aiohttp.ClientError, OSError) as e:
-                last_err = f"{short_server(srv.url)} -> {type(e).__name__}: {str(e)[:60]}"
-                srv.chunks_failed += 1
-                tried.add(srv.url)
-                await cancellable_sleep(0.5 + random.random(), cancel)
-            except RuntimeError as e:
-                last_err = f"{short_server(srv.url)} -> {e}"
-                srv.chunks_failed += 1
-                tried.add(srv.url)
-                await cancellable_sleep(0.5 + random.random(), cancel)
-            finally:
-                await srv.limiter.release()
+        # Reserve the Worker slot FIRST (cheap, spreads load), then a global
+        # network slot - the other way round a queued request could pin a
+        # network slot while waiting for a Worker that never frees up.
+        await srv.limiter.acquire()
+        try:
+            async with _network_slots:
+                try:
+                    data, dur = await _tts_request(session, srv, text, settings)
+                    await srv.limiter.success()
+                    srv.record_success()
+                    return data, dur, srv.url
+                except BusyError as e:
+                    last_err = f"{short_server(srv.url)} -> {e}"
+                    await srv.limiter.busy()
+                    tried.add(srv.url)
+                    await cancellable_sleep(1.0, cancel)
+                except ThrottleError as e:
+                    last_err = f"{short_server(srv.url)} -> {e}"
+                    await srv.limiter.throttled()
+                    secs = srv.quarantine(str(e), hint=e.retry_after)
+                    srv.chunks_failed += 1
+                    log.warning("chunk %d: %s -> benched %ds", index + 1, last_err, secs)
+                    tried.add(srv.url)
+                except VoiceError:
+                    raise
+                except FatalServerError as e:
+                    last_err = f"{short_server(srv.url)} -> {e}"
+                    srv.ok = False
+                    srv.error = str(e)
+                    srv.chunks_failed += 1
+                    log.error("chunk %d: %s (server disabled for this session)", index + 1, last_err)
+                    tried.add(srv.url)
+                except asyncio.TimeoutError:
+                    last_err = f"{short_server(srv.url)} -> timed out after {CHUNK_TIMEOUT}s"
+                    await srv.limiter.busy()
+                    soft(srv, last_err)
+                    tried.add(srv.url)
+                except (aiohttp.ClientError, OSError) as e:
+                    last_err = f"{short_server(srv.url)} -> {type(e).__name__}: {str(e)[:60]}"
+                    soft(srv, last_err)
+                    tried.add(srv.url)
+                    await cancellable_sleep(0.3 + random.random() * 0.7, cancel)
+                except TransientError as e:
+                    last_err = f"{short_server(srv.url)} -> {e}"
+                    soft(srv, last_err)
+                    tried.add(srv.url)
+                    await cancellable_sleep(0.3 + random.random() * 0.7, cancel)
+                except RuntimeError as e:
+                    last_err = f"{short_server(srv.url)} -> {e}"
+                    soft(srv, last_err)
+                    tried.add(srv.url)
+                    await cancellable_sleep(0.5 + random.random(), cancel)
+        finally:
+            await srv.limiter.release()
     raise RuntimeError(last_err)
 
 
@@ -1758,6 +1888,15 @@ def stage_line(current: str) -> str:
     return " › ".join(parts)
 
 
+def failure_budget() -> int:
+    """Chunk attempts that may fail in a row before the job drains and pauses.
+
+    Scales with the fleet (a 100-Worker fleet legitimately produces more scattered
+    hiccups) but is capped so a real outage is noticed within a minute or two.
+    """
+    return max(6, min(3 * max(1, len(pool.servers)), 40))
+
+
 def job_card(header: str, job: Job, body: str, footer: str = "") -> str:
     txt = f"{header}\n{stage_line(job.stage)}\n\n{body}"
     if footer:
@@ -1772,20 +1911,31 @@ async def wait_for_engines(session: aiohttp.ClientSession, cancel: asyncio.Event
     bench = pool.next_bench_end()
     if bench and not pool.usable():
         delay = max(5, min(delay, int(bench) + 1))
-    all_benched = bool(pool.states()) and all(s.benched or not s.ok for s in pool.states())
-    why = ("Microsoft is throttling every TTS Worker" if all_benched and any(s.benched for s in pool.states())
-           else "All TTS Workers are failing")
+    c = pool.counts()
+    if c["total"] and c["benched"] == c["total"]:
+        why = "Microsoft is rate-limiting every TTS Worker"
+    elif c["total"] and c["ok"] == 0:
+        why = "No TTS Worker is reachable"
+    else:
+        why = "Every attempt failed in a row (upstream hiccups)"
+    tip = ""
+    if c["total"] < 5:
+        tip = ("\n💡 Only " + str(c["total"]) + " Worker(s) registered - deploy more (free Cloudflare accounts) "
+               "and add them in 🛠 Admin → Workers; the job spreads over all of them.")
     await safe_edit(status,
                     f"{header}\n{stage_line('paused')}\n\n"
                     f"⏸ <b>Paused</b> - {why}.\n"
                     f"Last error: <code>{html.escape(reason[:160])}</code>\n"
-                    f"Workers: {html.escape(pool.summary())}\n"
+                    f"Workers: {html.escape(pool.summary())}{tip}\n"
                     f"Retrying in {delay}s (round {stall_round + 1}). The job does not give up - /cancel to stop.",
                     cancel_markup(job_id))
     await cancellable_sleep(delay, cancel)
     if cancel.is_set():
         raise JobCancelled()
-    await pool.refresh(session)
+    # Re-probe only the Workers that are in trouble; a healthy fleet of 100 does
+    # not need 100 /health calls every time one chunk round failed.
+    trouble = [s for s in pool.states() if (not s.ok) or s.benched]
+    await pool.refresh(session, only=trouble if trouble and len(trouble) < len(pool.states()) else None)
 
 
 async def run_audiobook_job(client: Client, status: Optional[Message], uid: int, job: Job,
@@ -1999,7 +2149,7 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
             spoken = estimate_seconds(job.done_chars - chars_at_start, settings["rate"])
             rt = spoken / elapsed if elapsed > 0 else 0
             inflight = sum(s.limiter.active for s in pool.states())
-            limit = sum(s.limiter.limit for s in pool.usable())
+            limit = pool.capacity()
             body = (f"{progress_bar(pct)} <b>{pct}%</b>\n"
                     f"📝 {job.done_chars:,} / {total_chars:,} chars · chunk {job.done_chunks}/{total}\n"
                     f"🎵 {fmt_duration(audio_so_far())} of audio ready\n"
@@ -2034,8 +2184,8 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
             if cancel.is_set():
                 raise JobCancelled()
             # fill the window
-            window = sum(s.limiter.limit for s in pool.usable()) + PIPELINE_WINDOW_EXTRA
-            if consecutive_failures >= max(6, 3 * max(1, len(pool.servers))):
+            window = min(pool.capacity() + PIPELINE_WINDOW_EXTRA, MAX_TOTAL_CONCURRENCY + PIPELINE_WINDOW_EXTRA)
+            if consecutive_failures >= failure_budget():
                 window = 0  # let the in-flight requests drain, then pause
             while (len(in_flight) < window and (pending_retry or next_index < total)):
                 if pending_retry:
@@ -2049,7 +2199,7 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
             if not in_flight:
                 if writer_index in done:
                     pass
-                elif not pool.usable() or consecutive_failures >= max(6, 3 * max(1, len(pool.servers))):
+                elif not pool.usable() or consecutive_failures >= failure_budget():
                     if stall_since is None:
                         stall_since = time.time()
                     if JOB_MAX_STALL_MINUTES and time.time() - stall_since > JOB_MAX_STALL_MINUTES * 60:
@@ -2119,7 +2269,7 @@ async def run_audiobook_job(client: Client, status: Optional[Message], uid: int,
                     job.done_chars += len(plan[i][1])
                 # re-queue failed chunks immediately while engines are still healthy; once
                 # too many attempts fail in a row we drain the window and pause instead
-                if round_failed and pool.usable() and consecutive_failures < max(6, 3 * max(1, len(pool.servers))):
+                if round_failed and pool.usable() and consecutive_failures < failure_budget():
                     pending_retry.extend(round_failed)
                     round_failed.clear()
 
@@ -2925,6 +3075,26 @@ async def handle_document(client: Client, message: Message):
     doc = message.document
     name = doc.file_name or "document.txt"
     ext = os.path.splitext(name)[1].lower()
+    if is_admin(uid) and admin_states.get(uid) == "add_server" and ext in (".txt", ".csv", ".list", ""):
+        # Fleet import: a text file with one Worker URL per line.
+        admin_states.pop(uid, None)
+        if (doc.file_size or 0) > 2 * 1024 * 1024:
+            await message.reply_text("❌ URL list is too large (max 2 MB).")
+            return
+        status = await message.reply_text("⬇️ Reading the URL list…")
+        try:
+            tmp = os.path.join(JOBS_DIR, f"urls_{uid}_{uuid.uuid4().hex[:6]}.txt")
+            os.makedirs(JOBS_DIR, exist_ok=True)
+            await message.download(file_name=tmp)
+            with open(tmp, "r", encoding="utf-8", errors="ignore") as fh:
+                content = fh.read()
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+        except Exception as e:  # noqa: BLE001
+            await safe_edit(status, f"❌ Could not read the file: {html.escape(str(e)[:100])}")
+            return
+        await add_servers(message, content, status=status)
+        return
     if ext not in SUPPORTED_EXT:
         await message.reply_text(f"❌ Unsupported file type <b>{html.escape(ext or '?')}</b>.\n"
                                  f"Supported: <code>{' '.join(sorted(SUPPORTED_EXT))}</code>")
@@ -3187,35 +3357,90 @@ def admin_home() -> Tuple[str, InlineKeyboardMarkup]:
     return txt, ikb(rows)
 
 
-def admin_workers(tested: bool = False) -> Tuple[str, InlineKeyboardMarkup]:
+WORKERS_PER_PAGE = 12
+
+
+def admin_workers(tested: bool = False, page: int = 0) -> Tuple[str, InlineKeyboardMarkup]:
+    """Fleet overview - stays readable with 100+ Workers (summary + paged list)."""
     sts = pool.states()
-    lines = [f"🖥 <b>Workers</b> ({len(sts)})" + (" · just re-tested" if tested else "")]
+    c = pool.counts()
+    lines = [f"🖥 <b>Workers</b> ({c['total']})" + (" · just re-tested" if tested else "")]
     if not sts:
-        lines.append("\nNone registered. Press ➕ Add and paste the Worker URL\n"
-                     "(<code>https://&lt;name&gt;.&lt;account&gt;.workers.dev</code>).")
-    for s in sts:
-        name = html.escape(short_server(s.url))
-        if s.benched:
-            lines.append(f"⛔ <b>{name}</b> · benched {fmt_duration(s.bench_left)} (throttle #{s.q_count})")
-        elif not s.ok:
-            lines.append(f"❌ <b>{name}</b> · {html.escape(s.error[:90] or 'unreachable')}")
-        else:
-            lines.append(f"✅ <b>{name}</b> · v{s.version or '?'} · {s.latency:.1f}s · "
-                         f"{s.limiter.active}/{s.limiter.limit} (max {s.limiter.ceiling}) · "
-                         f"done {s.chunks_done} · failed {s.chunks_failed}")
+        lines.append("\nNone registered. Press ➕ Add and paste Worker URLs\n"
+                     "(<code>https://&lt;name&gt;.&lt;account&gt;.workers.dev</code>, any number, one per line) "
+                     "or send a <code>.txt</code> file with one URL per line.")
+    else:
+        done_chunks = sum(x.chunks_done for x in sts)
+        failed_chunks = sum(x.chunks_failed for x in sts)
+        lines.append(f"✅ {c['ok']} healthy · ⛔ {c['benched']} benched · ❌ {c['down']} down\n"
+                     f"⚡ {c['active']}/{c['capacity']} requests in flight · "
+                     f"chunks this session {done_chunks} ok / {failed_chunks} failed")
+        # troubled Workers first so they are visible on page 1
+        order = sorted(sts, key=lambda x: (0 if x.benched else (1 if not x.ok else 2), x.url))
+        pages = max(1, (len(order) + WORKERS_PER_PAGE - 1) // WORKERS_PER_PAGE)
+        page = max(0, min(page, pages - 1))
+        lines.append(f"\n<i>page {page + 1}/{pages}</i>")
+        for x in order[page * WORKERS_PER_PAGE:(page + 1) * WORKERS_PER_PAGE]:
+            name = html.escape(short_server(x.url))
+            if x.benched:
+                lines.append(f"⛔ <b>{name}</b> · benched {fmt_duration(x.bench_left)} (#{x.q_count})")
+            elif not x.ok:
+                lines.append(f"❌ <b>{name}</b> · {html.escape(x.error[:60] or 'unreachable')}")
+            else:
+                lines.append(f"✅ <b>{name}</b> · v{x.version or '?'} · {x.latency:.1f}s · "
+                             f"{x.limiter.active}/{x.limiter.limit} · ok {x.chunks_done} / fail {x.chunks_failed}")
     lines.append(f"\n{_key_line()}")
-    rows = [[("➕ Add", "adm:wadd"), ("🔄 Test all", "adm:wtest")]]
+    rows: List[List[Tuple[str, str]]] = []
     if sts:
-        rows.append([("🗑 Remove", "adm:wdel")])
+        pages = max(1, (len(sts) + WORKERS_PER_PAGE - 1) // WORKERS_PER_PAGE)
+        if pages > 1:
+            nav: List[Tuple[str, str]] = []
+            if page > 0:
+                nav.append(("◀️", f"adm:workers:{page - 1}"))
+            nav.append((f"{page + 1}/{pages}", f"adm:workers:{page}"))
+            if page < pages - 1:
+                nav.append(("▶️", f"adm:workers:{page + 1}"))
+            rows.append(nav)
+    rows.append([("➕ Add", "adm:wadd"), ("🔄 Test all", "adm:wtest")])
+    if sts:
+        rows.append([("🗑 Remove", "adm:wdel:0")] + ([("🧹 Remove all failing", "adm:wpurge")] if c["down"] else []))
     rows.append([("🔙 Back", "adm:home")] + CLOSE_ROW)
-    return "\n".join(lines), ikb(rows)
+    return "\n".join(lines)[:4000], ikb(rows)
+
+
+def admin_remove_workers(page: int) -> Tuple[str, InlineKeyboardMarkup]:
+    urls = db.servers(enabled_only=False)
+    if not urls:
+        return "No Workers registered.", ikb([[("🔙 Back", "adm:workers")]])
+    per = 10
+    pages = max(1, (len(urls) + per - 1) // per)
+    page = max(0, min(page, pages - 1))
+    rows: List[List[Tuple[str, str]]] = []
+    for i in range(page * per, min(len(urls), (page + 1) * per)):
+        st = pool.servers.get(urls[i])
+        mark = "⛔" if st and st.benched else ("❌" if st and not st.ok else "🗑")
+        rows.append([(f"{mark} {short_server(urls[i])}", f"adm:wrm:{i}")])
+    nav: List[Tuple[str, str]] = []
+    if page > 0:
+        nav.append(("◀️", f"adm:wdel:{page - 1}"))
+    if pages > 1:
+        nav.append((f"{page + 1}/{pages}", f"adm:wdel:{page}"))
+    if page < pages - 1:
+        nav.append(("▶️", f"adm:wdel:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([("🔙 Back", "adm:workers")])
+    return ("🗑 <b>Remove Worker</b>\n\nTap a Worker to remove it (takes effect immediately). "
+            "❌ = unreachable, ⛔ = benched right now."), ikb(rows)
 
 
 ADD_SERVER_PROMPT = (
-    "➕ <b>Add Worker</b>\n\nSend the Worker URL, e.g.\n<code>https://edge-tts-worker.your-account.workers.dev</code>\n"
-    "(several: one per line or comma separated).\n\n"
-    "I run <code>/health</code> and a real <code>/tts</code> synthesis before registering it.\n"
-    "Tip: <code>/addserver &lt;url&gt;</code> works from anywhere.")
+    "➕ <b>Add Workers</b>\n\nSend Worker URLs, e.g.\n<code>https://edge-tts-worker.your-account.workers.dev</code>\n"
+    "Any number at once - one per line, comma or space separated - or upload a <code>.txt</code> file "
+    "with one URL per line (handy for a fleet of 100+).\n\n"
+    "Each URL gets a <code>/health</code> check and a real <code>/tts</code> synthesis "
+    f"({HEALTH_PARALLELISM} tested in parallel) before it is registered.\n"
+    "Tip: <code>/addserver &lt;url&gt; [&lt;url&gt; ...]</code> works from anywhere.")
 
 
 def admin_users() -> Tuple[str, InlineKeyboardMarkup]:
@@ -3319,7 +3544,8 @@ def admin_stats() -> Tuple[str, InlineKeyboardMarkup]:
            f"🎵 {fmt_duration(jobs['s'] or 0)} of audio from {(jobs['c'] or 0):,} chars\n"
            f"📅 Today: {today['n'] or 0} done · {fmt_duration(today['s'] or 0)}\n"
            f"⚙️ Now: {r_cnt} running · {w_cnt} waiting · chunks this session {done_chunks} ok / {failed_chunks} failed\n"
-           f"🖥 Workers {len(pool.usable())}/{len(pool.states())} usable · 💾 free disk {free_disk_mb(BASE_DIR):,.0f} MB · "
+           f"🖥 Workers {len(pool.usable())}/{len(pool.states())} usable · capacity {pool.capacity()} parallel · "
+           f"💾 free disk {free_disk_mb(BASE_DIR):,.0f} MB · "
            f"ffmpeg {'yes' if FFMPEG else 'no'}")
     return txt, ikb([[("🔄 Refresh", "adm:stats"), ("🔙 Back", "adm:home")] + CLOSE_ROW])
 
@@ -3356,12 +3582,10 @@ async def admin_render(msg: Message, page: str, arg: str, uid: int) -> None:
     admin_states.pop(uid, None)
     if page == "ulist":
         txt, markup = admin_user_list(int(arg or 0))
+    elif page == "workers":
+        txt, markup = admin_workers(page=int(arg or 0))
     elif page == "wdel":
-        urls = db.servers(enabled_only=False)
-        rows = [[(f"🗑 {short_server(u)}", f"adm:wrm:{i}")] for i, u in enumerate(urls)]
-        rows.append([("🔙 Back", "adm:workers")])
-        txt, markup = ("🗑 <b>Remove Worker</b>\n\nTap the Worker to remove it (takes effect immediately):"
-                       if urls else "No Workers registered."), ikb(rows)
+        txt, markup = admin_remove_workers(int(arg or 0))
     else:
         txt, markup = ADMIN_PAGES.get(page, admin_home)()
     await safe_edit(msg, txt, markup)
@@ -3446,7 +3670,17 @@ async def cb_admin(client: Client, cq: CallbackQuery):
             await cq.answer(f"Removed {short_server(urls[idx])}")
         else:
             await cq.answer("Already gone")
-        await admin_render(cq.message, "workers", "", uid)
+        await admin_render(cq.message, "wdel" if len(urls) > 1 else "workers", "0", uid)
+        return
+    if page == "wpurge":
+        # drop every Worker that is unreachable / misconfigured (NOT the benched ones -
+        # those are healthy Workers Microsoft is rate-limiting for a moment)
+        bad = [s.url for s in pool.states() if not s.ok and not s.benched]
+        for u in bad:
+            db.remove_server(u)
+        pool.sync_from_db()
+        await cq.answer(f"Removed {len(bad)} failing Worker(s)")
+        await admin_render(cq.message, "workers", "0", uid)
         return
     if page == "ok":
         note = await grant_access(client, int(arg), int(parts[3]) if len(parts) > 3 else 0)
@@ -3473,49 +3707,101 @@ async def cb_admin(client: Client, cq: CallbackQuery):
     await cq.answer()
 
 
-async def add_servers(message: Message, text: str) -> None:
-    """Probe every URL in ``text`` (health + real /tts) and register the good ones."""
-    if http_session is None:
-        await message.reply_text("Starting up, try again in a moment.")
-        return
+def parse_server_urls(text: str) -> List[str]:
     urls: List[str] = []
-    for raw in re.split(r"[\s,]+", text):
+    for raw in re.split(r"[\s,;]+", text or ""):
         nu = normalize_server_url(raw)
         if nu and nu not in urls:
             urls.append(nu)
+    return urls
+
+
+MAX_ADD_AT_ONCE = 500
+
+
+async def add_servers(message: Message, text: str, status: Optional[Message] = None) -> None:
+    """Probe every URL in ``text`` (health + real /tts, in parallel) and register the good ones.
+
+    Built for fleets: 100+ URLs in one message or .txt file are tested
+    HEALTH_PARALLELISM at a time with a live counter, and the result is a
+    compact summary (the failures listed individually).
+    """
+    if http_session is None:
+        await message.reply_text("Starting up, try again in a moment.")
+        return
+    urls = parse_server_urls(text)[:MAX_ADD_AT_ONCE]
     if not urls:
         await message.reply_text("❌ No valid URL found. Example: <code>https://name.account.workers.dev</code>",
                                  reply_markup=ikb([[("🔁 Try again", "adm:wadd"), ("🔙 Workers", "adm:workers")]]))
         return
-    status = await message.reply_text(f"🔍 Testing {len(urls)} Worker(s)…\n1️⃣ /health · 2️⃣ real /tts synthesis")
-    out: List[str] = ["➕ <b>Add Worker</b>"]
-    failed: List[str] = []
-    for n, u in enumerate(urls, 1):
-        await safe_edit(status, f"🔍 Testing Worker {n}/{len(urls)}: <code>{html.escape(short_server(u))}</code>\n"
-                                "1️⃣ /health · 2️⃣ real /tts synthesis…")
-        info = await check_server(http_session, u, deep=True)
-        if info["ok"]:
-            added = db.add_server(u)
-            out.append(f"✅ <b>{html.escape(short_server(u))}</b> · v{info.get('version') or '?'} · "
-                       f"{info.get('latency')}s · max_conc {info.get('max_concurrency', '?')}"
-                       + ("" if added else " (already registered)"))
-        else:
-            failed.append(u)
-            out.append(f"❌ <b>{html.escape(short_server(u))}</b>: {html.escape(info['error'] or 'unknown error')}")
+    already = set(db.servers(enabled_only=False))
+    fresh = [u for u in urls if u not in already]
+    dupes = len(urls) - len(fresh)
+    if status is None:
+        status = await message.reply_text(f"🔍 Testing {len(fresh)} Worker(s)…\n1️⃣ /health · 2️⃣ real /tts synthesis")
+    else:
+        await safe_edit(status, f"🔍 Testing {len(fresh)} Worker(s)…\n1️⃣ /health · 2️⃣ real /tts synthesis")
+
+    done = 0
+    ok_list: List[Tuple[str, Dict[str, Any]]] = []
+    failed: List[Tuple[str, str]] = []
+    last_edit = [0.0]
+    sem = asyncio.Semaphore(HEALTH_PARALLELISM)
+
+    async def probe(u: str) -> None:
+        nonlocal done
+        async with sem:
+            try:
+                info = await check_server(http_session, u, deep=True)
+            except Exception as e:  # noqa: BLE001
+                info = {"ok": False, "error": f"{type(e).__name__}"}
+            if info.get("ok"):
+                db.add_server(u)
+                ok_list.append((u, info))
+            else:
+                failed.append((u, info.get("error") or "unknown error"))
+            done += 1
+            now = time.time()
+            if now - last_edit[0] >= 2.5:
+                last_edit[0] = now
+                await safe_edit(status, f"🔍 Testing Workers… {done}/{len(fresh)}\n"
+                                        f"✅ {len(ok_list)} passed · ❌ {len(failed)} failed\n"
+                                        f"{progress_bar(int(100 * done / max(1, len(fresh))))}")
+
+    await asyncio.gather(*(probe(u) for u in fresh))
     pool.sync_from_db()
     if pool.states() and http_session is not None:
         with contextlib.suppress(Exception):
-            await pool.refresh(http_session)
+            await pool.refresh(http_session, only=[pool.servers[u] for u, _ in ok_list if u in pool.servers])
+
+    out: List[str] = [f"➕ <b>Add Workers</b> · {len(urls)} URL(s)"]
+    out.append(f"✅ <b>{len(ok_list)}</b> registered · ❌ {len(failed)} failed"
+               + (f" · {dupes} already registered" if dupes else ""))
+    if ok_list and len(ok_list) <= 15:
+        for u, info in ok_list:
+            out.append(f"✅ {html.escape(short_server(u))} · v{info.get('version') or '?'} · {info.get('latency')}s")
+    elif ok_list:
+        vers = sorted({str(i.get("version") or "?") for _, i in ok_list})
+        lat = sorted(float(i.get("latency") or 0) for _, i in ok_list)
+        out.append(f"   versions {', '.join(vers[:4])} · latency {lat[0]:.1f}s – {lat[-1]:.1f}s")
+    if failed:
+        out.append("")
+        for u, err in failed[:20]:
+            out.append(f"❌ <b>{html.escape(short_server(u))}</b>: {html.escape(err[:70])}")
+        if len(failed) > 20:
+            out.append(f"… and {len(failed) - 20} more")
     rows: List[List[Tuple[str, str]]] = []
     if failed:
         token = uuid.uuid4().hex[:8]
-        pending_servers[token] = (failed, time.time() + 900)
-        out.append("\nThe Worker failed the test - check the URL / API key, or add it anyway "
-                   "(the health loop re-tests it every few minutes).")
-        rows.append([("➕ Add anyway", f"addsrv:{token}"), ("🔁 Try again", "adm:wadd")])
-    out.append(f"\n🖥 Registered Workers: <b>{len(db.servers())}</b>")
+        pending_servers[token] = ([u for u, _ in failed], time.time() + 900)
+        out.append("\nFailed Workers were not added - check URL / API key / deployment, or add them anyway "
+                   "(the health loop re-tests them every few minutes).")
+        rows.append([("➕ Add failed anyway", f"addsrv:{token}"), ("🔁 Add more", "adm:wadd")])
+    else:
+        rows.append([("➕ Add more", "adm:wadd")])
+    out.append(f"\n🖥 Registered Workers: <b>{len(db.servers())}</b> · capacity ~{pool.capacity()} parallel requests")
     rows.append([("🖥 Workers", "adm:workers"), ("🛠 Admin panel", "adm:home")])
-    await safe_edit(status, "\n".join(out), ikb(rows))
+    await safe_edit(status, "\n".join(out)[:4000], ikb(rows))
 
 
 @bot.on_callback_query(filters.regex(r"^addsrv:"))

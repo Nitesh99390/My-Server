@@ -1,6 +1,6 @@
 {
   "name": "edge-tts-worker",
-  "version": "5.0.0",
+  "version": "5.2.0",
   "private": true,
   "description": "Edge-TTS render server for AudioBook Pro, running on Cloudflare Workers",
   "type": "module",

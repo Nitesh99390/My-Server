@@ -198,8 +198,103 @@ async def test_pipeline() -> None:
         await runner.cleanup()
 
 
+# ---------------------------------------------------------------------------
+# Fleet simulation: 30 fake Workers behind one aiohttp app (distinct URL paths).
+#   w00..w02  -> always 503 kind=throttle (Microsoft rate limit)   -> must be benched
+#   w03..w08  -> every 3rd request 502 kind=transient (hiccup)     -> must NOT be benched
+#   w09       -> 401 (wrong API key)                                -> disabled
+#   others    -> healthy
+# The book must still finish, spread over the healthy Workers.
+# ---------------------------------------------------------------------------
+FLEET = 30
+HITS = {}
+
+
+async def _fleet_health(r):
+    return web.json_response({"status": "ok", "version": "5.2.0-cf", "active_jobs": 0, "auth_required": False,
+                              "max_text_length": 6000, "max_concurrency": 4})
+
+
+async def _fleet_tts(r):
+    w = r.match_info["w"]
+    HITS[w] = HITS.get(w, 0) + 1
+    n = int(w[1:])
+    if n <= 2:
+        return web.json_response({"error": "TTS failed after 3 attempts: WSServerHandshakeError: WebSocket handshake failed with HTTP 403",
+                                  "kind": "throttle", "retry_after": 15}, status=503,
+                                 headers={"Retry-After": "15", "X-Error-Kind": "throttle"})
+    if 3 <= n <= 8 and HITS[w] % 3 == 0:
+        return web.json_response({"error": "TTS failed after 3 attempts: WebSocketError: Connection closed before turn.end",
+                                  "kind": "transient"}, status=502, headers={"X-Error-Kind": "transient"})
+    if n == 9:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    await asyncio.sleep(0.05 + (n % 5) * 0.02)
+    return web.Response(body=MP3, content_type="audio/mpeg", headers={"X-Duration-Ms": "2000"})
+
+
+async def test_fleet() -> None:
+    app = web.Application()
+    app.add_routes([web.get("/{w}/health", _fleet_health), web.post("/{w}/tts", _fleet_tts)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 8798)
+    await site.start()
+    B.http_session = aiohttp.ClientSession()
+    try:
+        for u in B.db.servers(enabled_only=False):
+            B.db.remove_server(u)
+        urls = [f"http://127.0.0.1:8798/w{i:02d}" for i in range(FLEET)]
+        # bulk add through the same code path the admin uses (parallel probes)
+        class M(FakeMsg):
+            async def reply_text(self, text, reply_markup=None, **kw):
+                FakeMsg.edits.append(text)
+                return FakeMsg()
+        FakeMsg.edits.clear()
+        await B.add_servers(M(), "\n".join(urls))
+        assert "registered" in FakeMsg.edits[-1], FakeMsg.edits[-1]
+        regs = B.db.servers()
+        assert len(regs) == FLEET - 4, f"throttled (3) + 401 (1) must fail the probe, got {len(regs)} registered"
+        # ... and "add anyway" for the throttled ones so the scheduler has to cope with them
+        for i in range(3):
+            B.db.add_server(urls[i], note="test")
+        B.pool.sync_from_db()
+        assert len(B.pool.states()) == FLEET - 1
+        # admin pages render with a big fleet
+        t, m = B.admin_workers()
+        assert "healthy" in t and any("▶️" in b.text for row in m.inline_keyboard for b in row), "pagination expected"
+        t, m = B.admin_workers(page=2)
+        assert "page 3/" in t
+        t, m = B.admin_remove_workers(0)
+        assert m.inline_keyboard
+        assert "/" in B.pool.summary() and "Workers" in B.pool.summary()
+
+        text = ("यह एक परीक्षण वाक्य है। " * 40 + "\n\n") * 30   # ~ 30 chunks at 600 chars
+        tp = os.path.join(TMP, "fleet.txt")
+        open(tp, "w").write(text)
+        FakeMsg.edits.clear()
+        FakeClient.sent.clear()
+        job = B.reserve_job(1, "Fleet Book", len(text))
+        t0 = time.time()
+        await B.run_audiobook_job(FakeClient(), FakeMsg(), 1, job, tp, "Fleet Book", B.db.settings(1), chat_id=1)
+        assert job.stage == "done" and FakeClient.sent, "fleet job must finish"
+        sts = {s.url.rsplit("/", 1)[-1]: s for s in B.pool.states()}
+        thr = [sts[f"w{i:02d}"] for i in range(3)]
+        assert thr and all(s.q_count >= 1 for s in thr), f"real 403 Workers must be benched: {[s.q_count for s in thr]}"
+        flaky = [sts[f"w{i:02d}"] for i in range(3, 9)]
+        assert all(s.q_count == 0 for s in flaky), f"transient errors must not bench: {[(s.url[-3:], s.q_count) for s in flaky]}"
+        assert all(HITS.get(f"w{i:02d}", 0) <= 4 for i in range(3)), f"throttled Workers must not be hammered: {[HITS.get(f'w{i:02d}') for i in range(3)]}"
+        used = {k for k, n in HITS.items() if n > 0 and int(k[1:]) >= 10}
+        assert len(used) >= 12, f"work must be spread over the fleet, only {len(used)} healthy Workers used"
+        print(f"fleet OK ({time.time() - t0:.1f}s, {len(used)} healthy Workers used, "
+              f"{sum(s.q_count for s in thr)} benches on throttled ones)")
+    finally:
+        await B.http_session.close()
+        await runner.cleanup()
+
+
 if __name__ == "__main__":
     test_migration()
     test_ui()
     B.LOOP.run_until_complete(test_pipeline())
+    B.LOOP.run_until_complete(test_fleet())
     print("\nALL OFFLINE TESTS PASSED")

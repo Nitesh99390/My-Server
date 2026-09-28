@@ -1,6 +1,6 @@
 /**
  * =============================================================================
- *  Edge-TTS Render Server - Cloudflare Worker edition   (v5.0.0-cf)
+ *  Edge-TTS Render Server - Cloudflare Worker edition   (v5.2.0-cf)
  * =============================================================================
  *  The TTS engine behind the AudioBook Pro Telegram bot.  Every request is
  *  independent: the Worker fans a long text out into several parallel Edge
@@ -29,13 +29,17 @@
 import { Communicate, listVoices, splitTextByByteLength } from "./edge_tts.js";
 import { buildSubtitles, validateParams } from "./validate.js";
 
-const VERSION = "5.0.0-cf";
+const VERSION = "5.2.0-cf";
 // Edge accepts ~4096 bytes of escaped text per websocket message.  Split the
 // raw text a little below that (escaping adds a few bytes) so every piece is
 // exactly one connection, then run the pieces in parallel.  Both are tunable
 // from wrangler.toml [vars] (PIECE_BYTES / PIECE_PARALLELISM).
+//
+// Fleet design: the bot spreads the book over MANY Workers (100+).  Each Worker
+// therefore only needs to be *gentle* with Microsoft - two websockets per
+// request is plenty and keeps every single Worker well under the 403 radar.
 const DEFAULT_PIECE_BYTES = 3800;
-const DEFAULT_PIECE_PARALLELISM = 4;
+const DEFAULT_PIECE_PARALLELISM = 2;
 const VOICE_CACHE_TTL_MS = 6 * 3600 * 1000;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 // Date.now() is frozen at 0 in the Worker global scope; initialise lazily on the first request.
@@ -64,8 +68,8 @@ function config(env) {
     maxTextLength: Math.max(1, envInt(env, "MAX_TEXT_LENGTH", 6000)),
     maxConcurrency: Math.max(1, Math.min(envInt(env, "MAX_CONCURRENCY", 6), 8)),
     defaultVoice: (env?.DEFAULT_VOICE || "hi-IN-MadhurNeural").trim(),
-    retries: Math.max(1, envInt(env, "TTS_RETRIES", 2)),
-    attemptTimeout: Math.max(10, envInt(env, "ATTEMPT_TIMEOUT", 45)),
+    retries: Math.max(1, envInt(env, "TTS_RETRIES", 3)),
+    attemptTimeout: Math.max(10, envInt(env, "ATTEMPT_TIMEOUT", 40)),
     // Whole-request budget; keep below the bot's CHUNK_TIMEOUT (150 s).
     synthTimeout: Math.max(5, envInt(env, "SYNTH_TIMEOUT", 110)),
     cors: envBool(env, "ENABLE_CORS", true),
@@ -194,6 +198,13 @@ class Throttled extends Error {
     this.retryAfter = retryAfter;
   }
 }
+/** Edge failed for a reason that is NOT rate limiting (timeout, reset, no audio) - retry elsewhere, do not bench. */
+class Transient extends Error {
+  constructor(detail) {
+    super(detail);
+    this.name = "Transient";
+  }
+}
 class HttpError extends Error {
   constructor(status, message) {
     super(message);
@@ -202,22 +213,30 @@ class HttpError extends Error {
   }
 }
 
-function looksThrottled(err) {
+/**
+ * Only a *real* rate-limit signal from Microsoft counts as throttling:
+ * HTTP 403/429 on the websocket handshake (after the clock-skew retry) or an
+ * explicit "too many requests" style message.  Everything else - handshake
+ * timeouts, resets, `NoAudioReceived`, a socket closed before `turn.end` - is
+ * a transient network failure.  The old heuristic treated all of those as
+ * throttling, which made the bot bench a perfectly healthy Worker for up to
+ * 10 minutes after a single hiccup.
+ */
+export function looksThrottled(err) {
+  if (!err) return false;
+  if (err.name === "WSServerHandshakeError" && (err.status === 403 || err.status === 429)) return true;
   const text = String(err?.message || err).toLowerCase();
   return (
-    text.includes("403") ||
-    text.includes("429") ||
-    text.includes("too many") ||
-    text.includes("throttl") ||
-    [
-      "WSServerHandshakeError",
-      "ClientResponseError",
-      "WebSocketError",
-      "NoAudioReceived",
-      "ServerDisconnectedError",
-      "ClientConnectorError",
-    ].includes(err?.name)
+    /\bhttp (403|429)\b/.test(text) ||
+    text.includes("too many requests") ||
+    text.includes("rate limit") ||
+    text.includes("throttl")
   );
+}
+
+/** Classify a synthesis error as "throttle" | "transient" (see looksThrottled). */
+export function classifyError(err) {
+  return looksThrottled(err) ? "throttle" : "transient";
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -312,6 +331,7 @@ async function synthesize(params, cfg, collectWords = false) {
   const pieces = splitPieces(params.text, cfg.pieceBytes);
   const pieceParallelism = collectWords ? 1 : cfg.pieceParallelism; // word offsets must stay sequential
 
+  let throttleHits = 0;
   const onePiece = async (text) => {
     let lastErr = null;
     for (let attempt = 1; attempt <= cfg.retries; attempt++) {
@@ -324,13 +344,24 @@ async function synthesize(params, cfg, collectWords = false) {
         return res;
       } catch (err) {
         lastErr = err;
-        if (looksThrottled(err)) runner.noteThrottle();
-        console.warn(`Synthesis attempt ${attempt}/${cfg.retries} failed (${err?.name}): ${err?.message}`);
+        const throttled = looksThrottled(err);
+        if (throttled) {
+          throttleHits += 1;
+          runner.noteThrottle();
+        }
+        console.warn(`Synthesis attempt ${attempt}/${cfg.retries} failed [${throttled ? "throttle" : "transient"}] (${err?.name}): ${err?.message}`);
+        // A real 403 means *this* Worker's egress is being rate limited right now;
+        // hammering it again within the same request just deepens the block.  Give
+        // up immediately so the bot moves the chunk to one of the other Workers.
+        if (throttled && throttleHits >= 2) break;
       } finally {
         runner.active -= 1;
       }
       if (attempt < cfg.retries) {
-        const backoff = Math.min(8, 1.5 ** attempt + Math.random() * 0.8);
+        // Transient: quick retry with jitter.  Throttle: back off harder (a new
+        // Sec-MS-GEC / muid is generated for every websocket anyway).
+        const base = looksThrottled(lastErr) ? 4 * attempt : 1.5 ** attempt;
+        const backoff = Math.min(12, base + Math.random() * 1.2);
         await sleep(Math.min(backoff * 1000, Math.max(0, deadline - Date.now())));
       }
     }
@@ -362,11 +393,14 @@ async function synthesize(params, cfg, collectWords = false) {
   } catch (err) {
     lastErr = err;
   }
+  if (lastErr instanceof HttpError) throw lastErr; // 504 from withTimeout
   const detail = `TTS failed after ${cfg.retries} attempts: ${lastErr?.name || "Error"}: ${lastErr?.message || lastErr}`;
   if (lastErr && looksThrottled(lastErr)) {
-    throw new Throttled(Math.min(60, 10 * Math.max(1, runner.throttleEvents)), detail);
+    // Retry-After is a hint for the bot's bench duration: short at first, longer
+    // when Microsoft keeps saying no.
+    throw new Throttled(Math.min(90, 15 * Math.max(1, Math.min(6, runner.throttleEvents))), detail);
   }
-  throw new Error(detail);
+  throw new Transient(detail);
 }
 
 // ---------------------------------------------------------------------------
@@ -379,8 +413,8 @@ function json(body, status = 200, headers = {}) {
   });
 }
 
-function errorResponse(ctx, message, status = 400, headers = {}) {
-  return json({ error: message, status, request_id: ctx.requestId }, status, headers);
+function errorResponse(ctx, message, status = 400, headers = {}, extra = {}) {
+  return json({ error: message, status, request_id: ctx.requestId, ...extra }, status, headers);
 }
 
 function timingSafeEqual(a, b) {
@@ -464,12 +498,15 @@ function mapSynthError(ctx, err) {
   if (err instanceof Throttled) {
     console.error(`[${ctx.requestId}] TTS throttled: ${err.message}`);
     stats.record(false, 0, 0, 0, err.message);
-    return errorResponse(ctx, err.message, 503, { "Retry-After": String(err.retryAfter) });
+    // `kind` lets the bot tell a real Microsoft rate limit (bench this Worker)
+    // from a transient hiccup (just retry on another Worker) without guessing.
+    return errorResponse(ctx, err.message, 503, { "Retry-After": String(err.retryAfter), "X-Error-Kind": "throttle" },
+      { kind: "throttle", retry_after: err.retryAfter });
   }
-  if (err?.message?.startsWith("TTS failed after")) {
+  if (err instanceof Transient || err?.message?.startsWith("TTS failed after")) {
     console.error(`[${ctx.requestId}] TTS error: ${err.message}`);
     stats.record(false, 0, 0, 0, err.message);
-    return errorResponse(ctx, err.message, 502);
+    return errorResponse(ctx, err.message, 502, { "X-Error-Kind": "transient" }, { kind: "transient" });
   }
   console.error(`[${ctx.requestId}] Unexpected TTS failure`, err);
   stats.record(false, 0, 0, 0, `${err?.name}: ${err?.message}`);
@@ -495,6 +532,8 @@ function health(cfg) {
     piece_parallelism: cfg.pieceParallelism,
     throttled: runner.throttled,
     throttle_events: runner.throttleEvents,
+    last_throttle_ago_s: runner.lastThrottleAt ? Math.round((Date.now() - runner.lastThrottleAt) / 1000) : null,
+    error_kinds: ["throttle", "transient"],
     auth_required: Boolean(cfg.apiKey),
     default_voice: cfg.defaultVoice,
     rate_limit_per_minute: 0,
@@ -645,10 +684,12 @@ async function ttsStreamRoute(request, url, cfg, ctx) {
       stats.record(false, 0, 0, 0, err.message);
       return errorResponse(ctx, err.message, 504);
     }
-    if (looksThrottled(err)) runner.noteThrottle();
-    console.error(`[${ctx.requestId}] Stream error: ${err?.name}: ${err?.message}`);
+    const kind = classifyError(err);
+    if (kind === "throttle") runner.noteThrottle();
+    console.error(`[${ctx.requestId}] Stream error [${kind}]: ${err?.name}: ${err?.message}`);
     stats.record(false, 0, 0, 0, String(err?.message || err));
-    return errorResponse(ctx, "Upstream synthesis failed before any audio was received", 502);
+    return errorResponse(ctx, `Upstream synthesis failed before any audio was received (${err?.name}: ${err?.message})`,
+      kind === "throttle" ? 503 : 502, { "X-Error-Kind": kind }, { kind });
   }
   if (first === null) {
     stats.record(false, 0, 0, 0, "The upstream service returned no audio");
@@ -774,7 +815,7 @@ function withCommonHeaders(resp, ctx, cfg) {
     headers.set("Access-Control-Allow-Origin", "*");
     headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     headers.set("Access-Control-Allow-Headers", "Content-Type, X-API-Key, X-Request-ID, Authorization");
-    headers.set("Access-Control-Expose-Headers", "X-Duration-Ms, X-Char-Count, X-Voice, X-Cache, X-Request-ID, Content-Length");
+    headers.set("Access-Control-Expose-Headers", "X-Duration-Ms, X-Char-Count, X-Voice, X-Cache, X-Request-ID, X-Error-Kind, Retry-After, Content-Length");
   }
   return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers });
 }
