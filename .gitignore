@@ -22,3 +22,13 @@ tmp/
 
 # Build output
 dist/
+
+# Bot runtime (bot.py on the VPS)
+*.session
+*.session-journal
+*.db
+*.db-wal
+*.db-shm
+jobs/
+venv/
+__pycache__/
