@@ -19,3 +19,6 @@ tmp/
 .vscode/
 .idea/
 .DS_Store
+
+# Build output
+dist/

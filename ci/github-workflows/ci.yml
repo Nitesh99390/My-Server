@@ -1,0 +1,43 @@
+# Runs the worker's unit tests on every push and pull request.
+# The live Edge-TTS test is skipped in CI (EDGE_TTS_LIVE=0) so a Microsoft
+# throttle or network hiccup never turns a good commit red.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Unit tests (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - run: npm ci
+
+      - name: Run tests (offline)
+        run: npm test
+        env:
+          EDGE_TTS_LIVE: "0"
+
+      - name: Dry-run build with wrangler
+        run: npx wrangler deploy --dry-run --outdir=dist
