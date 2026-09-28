@@ -28,6 +28,36 @@ npx wrangler deploy
 Then register `https://<name>.<account>.workers.dev` in the bot
 (Admin Panel -> Add Server).
 
+## CI / auto-deploy (GitHub Actions)
+
+Two ready-made workflows live in [`ci/github-workflows/`](ci/github-workflows/).
+GitHub only runs them from `.github/workflows/`, and the bot that opens PRs is
+not allowed to write there, so enable them once by hand (any of these):
+
+- **Locally:** `sh ci/install-workflows.sh && git push`
+- **GitHub web UI:** *Add file -> Create new file*, name it
+  `.github/workflows/ci.yml`, paste the contents of `ci/github-workflows/ci.yml`,
+  commit; repeat for `deploy.yml`.
+
+| Workflow | Trigger | What it does |
+| --- | --- | --- |
+| `ci.yml` | every push / PR | `npm test` (offline) on Node 20 + 22, then `wrangler deploy --dry-run` |
+| `deploy.yml` | push to `main` touching `worker/**`, or manual run | tests -> `wrangler deploy` -> optional `API_KEY` secret -> `/health` smoke test |
+
+Auto-deploy is **off until you add secrets** (the job just prints a notice):
+
+1. Cloudflare dashboard -> *My Profile -> API Tokens -> Create Token* ->
+   template **Edit Cloudflare Workers**. Copy the token.
+2. *Workers & Pages -> Overview* -> copy the **Account ID** (right sidebar).
+3. GitHub repo -> *Settings -> Secrets and variables -> Actions*:
+   - secret `CLOUDFLARE_API_TOKEN`
+   - secret `CLOUDFLARE_ACCOUNT_ID`
+   - secret `TTS_API_KEY` *(optional - becomes the Worker's `API_KEY`)*
+   - variable `WORKER_URL` *(optional - e.g. `https://edge-tts-worker.<account>.workers.dev`, enables the post-deploy health check)*
+
+After that every merge to `main` ships the Worker automatically; you can also
+run it by hand from the *Actions* tab (**Deploy -> Run workflow**).
+
 Local development:
 
 ```bash

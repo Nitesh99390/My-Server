@@ -1,0 +1,86 @@
+# Deploys the Worker to Cloudflare whenever `main` changes (or on demand).
+#
+# One-time setup - add two repository secrets (Settings -> Secrets -> Actions):
+#   CLOUDFLARE_API_TOKEN   token with the "Edit Cloudflare Workers" template
+#   CLOUDFLARE_ACCOUNT_ID  from the Workers & Pages overview page
+# Optional: TTS_API_KEY - if set it is pushed as the Worker secret API_KEY.
+#
+# Until the secrets exist the job is skipped, so the workflow is safe to merge.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "worker/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Cloudflare Workers
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      HAS_CF_SECRETS: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && secrets.CLOUDFLARE_ACCOUNT_ID != '' }}
+      HAS_TTS_API_KEY: ${{ secrets.TTS_API_KEY != '' }}
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
+
+      - run: npm ci
+
+      - name: Run tests (offline)
+        run: npm test
+        env:
+          EDGE_TTS_LIVE: "0"
+
+      - name: Skip - Cloudflare secrets not configured
+        if: env.HAS_CF_SECRETS != 'true'
+        run: |
+          echo "::notice::CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID not set - skipping deploy."
+          echo "Add them under Settings -> Secrets and variables -> Actions to enable auto-deploy."
+
+      - name: Deploy worker
+        if: env.HAS_CF_SECRETS == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker
+          command: deploy
+
+      - name: Push API_KEY secret (optional)
+        if: env.HAS_CF_SECRETS == 'true' && env.HAS_TTS_API_KEY == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker
+          secrets: |
+            API_KEY
+        env:
+          API_KEY: ${{ secrets.TTS_API_KEY }}
+
+      - name: Smoke test /health
+        if: env.HAS_CF_SECRETS == 'true' && vars.WORKER_URL != ''
+        run: |
+          for i in 1 2 3 4 5; do
+            if curl -fsS "${{ vars.WORKER_URL }}/health" | tee /tmp/health.json; then
+              grep -q '"status":"ok"' /tmp/health.json && exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Deployed worker did not report status ok"; exit 1
