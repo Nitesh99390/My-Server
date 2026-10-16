@@ -2,21 +2,26 @@
  * edge_tts.js - Microsoft Edge "Read Aloud" TTS client for Cloudflare Workers.
  *
  * A faithful port of the wire protocol implemented by the Python `edge-tts`
- * package (v7.x): DRM `Sec-MS-GEC` token, `speech.config` + SSML messages,
+ * package (v7.3.x): DRM `Sec-MS-GEC` **v2** token (see drm.js - Microsoft
+ * started rejecting the old v1 token with HTTP 403 in October 2026),
+ * `speech.config` + SSML messages,
  * 2-byte-header binary audio frames, `audio.metadata` word boundaries,
  * 4096-byte text splitting with CBR offset compensation, and the 403 clock-skew
  * retry.  Only Web-platform APIs are used (fetch/WebSocket/crypto), so the same
  * file runs in Workers and in Node >= 20 (tests).
  */
 
-export const TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
+import { TRUSTED_CLIENT_TOKEN, generateSecMsGecV2 } from "./drm.js";
+
+export { TRUSTED_CLIENT_TOKEN };
 const BASE_URL = "speech.platform.bing.com/consumer/speech/synthesize/readaloud";
 const WSS_URL = `wss://${BASE_URL}/edge/v1?TrustedClientToken=${TRUSTED_CLIENT_TOKEN}`;
 const VOICE_LIST_URL = `https://${BASE_URL}/voices/list?trustedclienttoken=${TRUSTED_CLIENT_TOKEN}`;
 
 const CHROMIUM_FULL_VERSION = "143.0.3650.75";
 const CHROMIUM_MAJOR_VERSION = CHROMIUM_FULL_VERSION.split(".")[0];
-export const SEC_MS_GEC_VERSION = `1-${CHROMIUM_FULL_VERSION}`;
+// "2-" prefix = v2 token format (edge-tts >= 7.3.0).  v1 ("1-") now gets 403.
+export const SEC_MS_GEC_VERSION = `2-${CHROMIUM_FULL_VERSION}`;
 
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
@@ -112,12 +117,19 @@ export const DRM = {
     return true;
   },
 
-  /** SHA-256(uppercase hex) of  <windows file time floored to 5 min><token>. */
+  /**
+   * v2 token: "<16 hex CS64>-<64 hex SHA-256>" over
+   * <windows file time floored to 5 min><token>  (see drm.js).
+   * Kept async for API compatibility with the old v1 implementation.
+   */
   async generateSecMsGec() {
+    return generateSecMsGecV2(DRM.unixTimestamp());
+  },
+
+  /** Legacy v1 token (plain SHA-256) - only kept for tests / diagnostics. */
+  async generateSecMsGecV1() {
     let ticks = DRM.unixTimestamp() + WIN_EPOCH;
     ticks -= ticks % 300;
-    // 100-nanosecond intervals.  Value is < 2^53 for the foreseeable future,
-    // but use BigInt to get exact integer formatting like Python's f"{ticks:.0f}".
     const fileTime = BigInt(Math.floor(ticks)) * 10_000_000n;
     const data = new TextEncoder().encode(`${fileTime}${TRUSTED_CLIENT_TOKEN}`);
     const digest = await crypto.subtle.digest("SHA-256", data);
