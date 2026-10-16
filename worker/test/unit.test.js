@@ -1,18 +1,41 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { DRM, TRUSTED_CLIENT_TOKEN, splitTextByByteLength, mkssml, parseHeaders, xmlEscape, Communicate } from "../src/edge_tts.js";
+import { DRM, TRUSTED_CLIENT_TOKEN, SEC_MS_GEC_VERSION, splitTextByByteLength, mkssml, parseHeaders, xmlEscape, Communicate } from "../src/edge_tts.js";
+import { generateSecMsGecV2, windowTicks } from "../src/drm.js";
 import { validateParams, detectScript, voiceCanRead, normalizeText, buildSubtitles } from "../src/validate.js";
 import { splitPieces, mapLimit, looksThrottled, classifyError } from "../src/index.js";
 import { WSServerHandshakeError, WebSocketError, NoAudioReceived } from "../src/edge_tts.js";
 
-test("Sec-MS-GEC matches the reference Python algorithm", async () => {
-  const token = await DRM.generateSecMsGec();
+test("Sec-MS-GEC v1 (legacy) matches plain SHA-256", async () => {
+  const token = await DRM.generateSecMsGecV1();
   let ticks = Date.now() / 1000 + 11644473600;
   ticks -= ticks % 300;
   const ref = createHash("sha256").update(`${Math.floor(ticks)}0000000${TRUSTED_CLIENT_TOKEN}`).digest("hex").toUpperCase();
   assert.equal(token.length, 64);
   assert.equal(token, ref);
+});
+
+// Reference values produced by the Python package edge-tts 7.3.1
+// (edge_tts.drm.generate_sec_ms_gec_v2(ts)) - the algorithm Edge 155 uses.
+const V2_VECTORS = [
+  [1760597400, "E6B2EA85E132E639-1424A40540B5F1D780EFB7F80E58E55F2607F92810E82D39E373D9D3FF119543"],
+  [1760597700, "1BED3D4889D806E0-A21100562F9C2C5563C063813F003ECED0091BCE769DA65B57C52810FA614B74"],
+  [0, "52BC7A17B50DFEC9-28C4394775C8751CD2F6859C030C06DB1489ACAB3B3A7651831FC26895177ED6"],
+  [1234567890, "BA405D1577B8E0CE-61F01E88539977A1A1E969572D82EECFA45FB1E5DEBD122D6ACBAF0054F959E5"],
+  [1800000000, "99E54519B490BE5C-E162DB0977FBDCB9B86DD8148BF1BCDC3C0303176CE39852A42B415935C20654"],
+  [1760598000.5, "103B83AA16DC44EC-D53A34C539229019C0E3E463311DA764E6225F46E3F9A936FA168131A0B26AFA"],
+];
+
+test("Sec-MS-GEC v2 matches edge-tts 7.3.1 reference vectors byte for byte", async () => {
+  for (const [ts, expected] of V2_VECTORS) assert.equal(generateSecMsGecV2(ts), expected);
+  // same 5-minute window -> same token
+  assert.equal(generateSecMsGecV2(1760597400), generateSecMsGecV2(1760597699));
+  assert.notEqual(generateSecMsGecV2(1760597400), generateSecMsGecV2(1760597700));
+  assert.equal(windowTicks(1760597400), "134050710000000000"); // 5-min floored Windows file time (100 ns ticks)
+  const live = await DRM.generateSecMsGec();
+  assert.match(live, /^[0-9A-F]{16}-[0-9A-F]{64}$/, "DRM.generateSecMsGec must emit the v2 format");
+  assert.match(SEC_MS_GEC_VERSION, /^2-\d+\.\d+\.\d+\.\d+$/, "version header must announce v2");
 });
 
 test("splitTextByByteLength respects byte limit, utf-8 and entities", () => {

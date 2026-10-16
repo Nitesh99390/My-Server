@@ -1,6 +1,6 @@
 /**
  * =============================================================================
- *  Edge-TTS Render Server - Cloudflare Worker edition   (v5.2.0-cf)
+ *  Edge-TTS Render Server - Cloudflare Worker edition   (v5.2.1-cf)
  * =============================================================================
  *  The TTS engine behind the AudioBook Pro Telegram bot.  Every request is
  *  independent: the Worker fans a long text out into several parallel Edge
@@ -29,7 +29,7 @@
 import { Communicate, listVoices, splitTextByByteLength } from "./edge_tts.js";
 import { buildSubtitles, validateParams } from "./validate.js";
 
-const VERSION = "5.2.0-cf";
+const VERSION = "5.2.1-cf";
 // Edge accepts ~4096 bytes of escaped text per websocket message.  Split the
 // raw text a little below that (escaping adds a few bytes) so every piece is
 // exactly one connection, then run the pieces in parallel.  Both are tunable
@@ -538,7 +538,7 @@ function health(cfg) {
     default_voice: cfg.defaultVoice,
     rate_limit_per_minute: 0,
     cache: { enabled: cfg.cacheTtl > 0, ttl_seconds: cfg.cacheTtl, backend: "cloudflare-cache-api" },
-    edge_tts_version: "js-port-of-7.2.8",
+    edge_tts_version: "js-port-of-7.3.1 (Sec-MS-GEC v2)",
   });
 }
 

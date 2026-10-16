@@ -169,6 +169,14 @@ and `python tests_bot/test_routing.py`.
 
 ## 2. TTS Worker on Cloudflare (`worker/`)
 
+> **Oct 2026 - every Worker started answering `503 kind=throttle` / 403 and
+> no audio at all?**  Microsoft switched the Edge Read-Aloud DRM token from
+> `Sec-MS-GEC` **v1** (plain SHA-256) to **v2** (`<16 hex>-<64 hex>`,
+> `Sec-MS-GEC-Version=2-...`).  Worker `5.2.1-cf` ships the v2 generator
+> (`worker/src/drm.js`, a port of edge-tts 7.3.1).  **Redeploy every Worker in
+> the fleet** - `./deploy-fleet.sh accounts.txt` or `npx wrangler deploy` -
+> nothing in the bot needs to change.
+
 ## Quick start
 
 ```bash
@@ -310,4 +318,13 @@ All errors are JSON: `{"error": "...", "status": <code>, "request_id": "...", "k
 
 ## Version
 
-Worker `5.2.0-cf` - see `X-Server-Version` or `GET /health`.
+Worker `5.2.1-cf` - see `X-Server-Version` or `GET /health`
+(`edge_tts_version` shows `js-port-of-7.3.1 (Sec-MS-GEC v2)` once the new
+build is live).
+
+### 5.2.1 - Sec-MS-GEC v2 (fixes "no audio / 403 from every Worker")
+
+- `worker/src/drm.js`: new v2 token generator (CS64 + salted SHA-256), output
+  verified byte-for-byte against the Python `edge-tts` 7.3.1 reference.
+- `Sec-MS-GEC-Version` now `2-143.0.3650.75`; endpoint/host unchanged.
+- Unit tests carry reference vectors so a regression is caught offline.
